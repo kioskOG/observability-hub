@@ -1,0 +1,37 @@
+version: "3"
+services:
+  us-east:
+    ports:
+      - 5000
+    environment:
+      - REGION=us-east
+      - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040
+      - PARAMETERS_POOL_SIZE=1000
+      - PARAMETERS_POOL_BUFFER_SIZE_KB=1000
+    image: docker.io/simonswine/rideshare-go-push:0.1.0
+
+  eu-north:
+    ports:
+      - 5000
+    environment:
+      - REGION=eu-north
+      - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040
+    image: docker.io/simonswine/rideshare-go-push:0.3.0
+
+  ap-south:
+    ports:
+      - 5000
+    environment:
+      - REGION=ap-south
+      - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040
+    image: docker.io/simonswine/rideshare-go-push:0.4.0
+
+  pyroscope:
+    image: grafana/pyroscope:latest
+    ports:
+      - '4040:4040'
+
+  load-generator:
+    image: docker.io/simonswine/rideshare-go-push-loadgen:0.4.0
+    environment:
+      - PYROSCOPE_SERVER_ADDRESS=http://pyroscope:4040

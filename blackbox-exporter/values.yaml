@@ -1,0 +1,43 @@
+config:
+  modules:
+    http_2xx:
+      prober: http
+      timeout: 5s
+      http:
+        valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+        follow_redirects: true
+        preferred_ip_protocol: "ip4"
+        tls_config:
+          insecure_skip_verify: true
+    tcp_connect:
+      prober: tcp
+      timeout: 5s
+      tcp:
+        preferred_ip_protocol: "ip4"
+    icmp:
+      prober: icmp
+      timeout: 5s
+
+serviceMonitor:
+  enabled: true
+  defaults:
+    labels:
+      release: kube-prometheus-stack
+  interval: 15s
+  targets:
+    - name: google
+      url: https://www.google.com/
+      additionalRelabeling: []
+    - name: facebook
+      url: https://www.facebook.com/
+    # - name: tcp-ssh
+    #   module: tcp_connect
+    #   url: ssh.yourdomain.com:22
+    - name: icmp-ping
+      module: icmp
+      url: 8.8.8.8
+      additionalRelabeling: []
+
+# https://itnext.io/prometheus-kubernetes-endpoints-monitoring-with-blackbox-exporter-a027ae136b8d
+
+# helm upgrade --install prometheus-blackbox-exporter prometheus-community/prometheus-blackbox-exporter -n monitoring -f blackbox-exporter/values.yaml

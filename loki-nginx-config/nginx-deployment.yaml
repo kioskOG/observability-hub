@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-nginx-proxy
+  namespace: loki
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki-nginx-proxy
+  template:
+    metadata:
+      labels:
+        app: loki-nginx-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: loki-nginx-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-nginx
+  namespace: loki
+spec:
+  ports:
+    - port: 3100
+      targetPort: 3100
+      protocol: TCP
+      name: http
+  selector:
+    app: loki-nginx-proxy

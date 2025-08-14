@@ -1,0 +1,151 @@
+// -------------------------------
+    // PYROSCOPE PROFILING
+    // -------------------------------
+
+    pyroscope.write "pyroscope" {
+      endpoint {
+        url = "http://pyroscope-distributor.pyroscope.svc.cluster.local:4040"
+      }
+      external_labels = {
+        cluster     = sys.env("KUBE_CLUSTER_NAME"),
+        environment = sys.env("ENVIRONMENT_NAME"),
+        region      = sys.env("AWS_REGION"),
+        cloud       = sys.env("CLOUD_PROVIDER"),
+        platform    = sys.env("PLATFORM_TYPE"),
+        node        = sys.env("KUBE_NODE_NAME"),
+      }
+    }
+
+    discovery.relabel "profiling_targets" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_scrape"]
+        regex         = "true"
+        action        = "keep"
+      }
+
+      rule {
+        source_labels = ["__address__", "__meta_kubernetes_pod_annotation_pyroscope_io_port"]
+        regex         = "([^:]+)(?::\\d+)?;(.+)"
+        replacement   = "$1:$2"
+        target_label  = "__address__"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_profile_path"]
+        regex         = "(.+)"
+        replacement   = "$1"
+        target_label  = "__path__"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__path__"]
+        regex         = "^$"
+        replacement   = "/debug/pprof/profile"
+        target_label  = "__path__"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+        target_label  = "app"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_service_name", "__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+        regex         = "(.+);.*"
+        replacement   = "$1"
+        target_label  = "service_name"
+        action        = "replace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_service_name", "__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+        regex         = ";(.+)"
+        replacement   = "$1"
+        target_label  = "service_name"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid"]
+        target_label  = "pod_uid"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_node_name"]
+        target_label  = "node"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        target_label  = "job"
+      }
+
+      rule {
+        target_label = "cluster"
+        replacement  = sys.env("KUBE_CLUSTER_NAME")
+      }
+      rule {
+        target_label = "environment"
+        replacement  = sys.env("ENVIRONMENT_NAME")
+      }
+      rule {
+        target_label = "region"
+        replacement  = sys.env("AWS_REGION")
+      }
+      rule {
+        target_label = "cloud"
+        replacement  = sys.env("CLOUD_PROVIDER")
+      }
+      rule {
+        target_label = "platform"
+        replacement  = sys.env("PLATFORM_TYPE")
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_profile_path_allocs"]
+        regex         = "(.+)"
+        replacement   = "$1"
+        target_label  = "__path__"
+        action        = "replace"
+      }
+
+      rule {
+        source_labels = ["__path__", "__meta_kubernetes_pod_annotation_pyroscope_io_profile_path_allocs"]
+        regex         = "^/debug/pprof/profile$;(.+)"
+        replacement   = "$1"
+        target_label  = "__path__"
+        action        = "replace"
+      }
+    }
+
+    pyroscope.scrape "kubernetes_cpu_profiles" {
+      targets         = discovery.relabel.profiling_targets.output
+      forward_to      = [pyroscope.write.pyroscope.receiver]
+      delta_profiling_duration = "9s"
+      scrape_interval = "10s"
+      scrape_timeout  = "5s"
+    }
+
+    pyroscope.scrape "kubernetes_heap_profiles" {
+      targets         = discovery.relabel.profiling_targets.output
+      forward_to      = [pyroscope.write.pyroscope.receiver]
+      delta_profiling_duration = "29s"
+      scrape_interval = "30s"
+      scrape_timeout  = "5s"
+    }

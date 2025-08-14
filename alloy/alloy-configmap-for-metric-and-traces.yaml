@@ -1,0 +1,226 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: alloy-logs
+data:
+  config.alloy: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+        action        = "replace"
+        target_label  = "app"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name"]
+        separator     = "/"
+        target_label  = "job"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_node_name"]
+        target_label  = "node"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        action        = "replace"
+        replacement   = "/var/log/pods/*$1/*.log"
+        target_label  = "__path__"
+      }
+
+      rule {
+        action        = "replace"
+        source_labels = ["__meta_kubernetes_pod_container_id"]
+        regex         = "^(\\\\w+):\\/\\/.+$"
+        replacement   = "$1"
+        target_label  = "tmp_container_runtime"
+      }
+    }
+
+    local.file_match "pod_logs" {
+      path_targets = discovery.relabel.pod_logs.output
+    }
+
+    loki.source.file "pod_logs" {
+      targets    = local.file_match.pod_logs.targets
+      forward_to = [loki.process.pod_logs.receiver]
+    }
+
+    loki.source.kubernetes_events "cluster_events" {
+      job_name   = "integrations/kubernetes/eventhandler"
+      log_format = "logfmt"
+      forward_to = [loki.process.cluster_events.receiver]
+    }
+
+    loki.process "pod_logs" {
+      stage.static_labels {
+        values = {
+          cluster = "MillenniumFalcon",
+        }
+      }
+
+      stage.match {
+        selector = "{tmp_container_runtime=\"containerd\"}"
+        stage.cri {}
+        stage.labels {
+          values = {
+            flags  = "",
+            stream = "",
+          }
+        }
+      }
+
+      stage.match {
+        selector = "{tmp_container_runtime=\"docker\"}"
+        stage.docker {}
+        stage.labels {
+          values = {
+            stream = "",
+          }
+        }
+      }
+
+      stage.label_drop {
+        values = ["tmp_container_runtime"]
+      }
+
+      stage.match {
+        selector = "{namespace=~\"(monitring|default)\"}"
+        stage.regex {
+          expression = "(?P<method>GET|PUT|DELETE|POST)"
+        }
+        stage.regex {
+          expression = "(?P<status_code_with_http_version>HTTP.{6}\\d{3})"
+        }
+        stage.regex {
+          expression = "(?P<status_code>\\d{3})"
+          source     = "status_code_with_http_version"
+        }
+        stage.labels {
+          values = {
+            method      = "",
+            status_code = "",
+          }
+        }
+      }
+
+      stage.json {
+        expressions = {
+          level   = "level",
+          app     = "app",
+          env     = "env",
+          message = "message",
+        }
+      }
+
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    loki.process "cluster_events" {
+      stage.static_labels {
+        values = {
+          cluster     = "MillenniumFalcon",
+          event_type  = "kubernetes",
+        }
+      }
+
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    loki.write "loki" {
+      endpoint {
+        url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+        headers = {
+          "Authorization" = "Basic bG9raS1jYW5hcnk6bG9raS1jYW5hcnk=",
+          "X-Scope-OrgID" = "tenant1",
+        }
+      }
+    }
+
+    otelcol.receiver.otlp "default" {
+      grpc {
+        endpoint = "0.0.0.0:4317"
+      }
+      http {}
+
+      output {
+        traces = [
+          otelcol.processor.k8sattributes.default.input,
+          otelcol.connector.spanlogs.default.input,
+        ]
+      }
+    }
+
+    otelcol.processor.k8sattributes "default" {
+      extract {
+        metadata = [
+          "k8s.namespace.name",
+          "k8s.pod.name",
+          "k8s.container.name",
+          "k8s.deployment.name",
+          "k8s.statefulset.name",
+          "k8s.daemonset.name",
+        ]
+      }
+
+      output {
+        traces = [otelcol.processor.batch.default.input]
+      }
+    }
+
+    otelcol.processor.batch "default" {
+      output {
+        traces = [otelcol.exporter.otlp.tempo.input]
+      }
+    }
+
+    otelcol.exporter.otlp "tempo" {
+      client {
+        endpoint = "tempo-distributor.tempo.svc.cluster.local:4317"
+        tls {
+          insecure = true
+          insecure_skip_verify = true
+        }
+      }
+    }
+
+    otelcol.connector.spanlogs "default" {
+      roots           = true
+      span_attributes = ["http.method", "http.target"]
+
+      output {
+        logs = [otelcol.exporter.loki.spanlogs_exporter.input]
+      }
+    }
+
+    otelcol.exporter.loki "spanlogs_exporter" {
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    livedebugging {
+      enabled = true
+    }

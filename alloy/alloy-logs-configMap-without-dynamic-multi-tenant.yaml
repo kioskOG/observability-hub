@@ -1,0 +1,177 @@
+apiVersion: v1
+data:
+  config.alloy: |
+    discovery.kubernetes "pods" {
+      role = "pod"
+    }
+
+    discovery.relabel "pod_logs" {
+      targets = discovery.kubernetes.pods.targets
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      // ENHANCEMENT: Added app label for better organization
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+        action = "replace"
+        target_label = "app"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name"]
+        separator     = "/"
+        target_label  = "job"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        action        = "replace"
+        replacement   = "/var/log/pods/*$1/*.log"
+        target_label  = "__path__"
+      }
+      rule {
+        action = "replace"
+        source_labels = ["__meta_kubernetes_pod_container_id"]
+        regex = "^(\\w+):\\/\\/.+$"
+        replacement = "$1"
+        target_label = "tmp_container_runtime"
+      }
+    }
+
+    local.file_match "pod_logs" {
+      path_targets = discovery.relabel.pod_logs.output
+    }
+
+    // Collects stdout/stderr logs from Kubernetes pods (your "app logs")
+    loki.source.file "pod_logs" {
+      targets    = local.file_match.pod_logs.targets
+      forward_to = [loki.process.pod_logs.receiver]
+    }
+
+    // Collects Kubernetes API events
+    loki.source.kubernetes_events "cluster_events" {
+      job_name   = "integrations/kubernetes/eventhandler"
+      log_format = "logfmt"
+      forward_to = [loki.process.cluster_events.receiver]
+    }
+
+
+    loki.process "pod_logs" {
+    // Static cluster label for all pod logs
+      stage.static_labels {
+        values = {
+          cluster = "MillenniumFalcon",
+        }
+      }
+
+      // ENHANCEMENT: Process container runtime formats universally first
+      stage.match {
+        selector = "{tmp_container_runtime=\"containerd\"}"
+        stage.cri {}
+        stage.labels {
+          values = {
+            flags  = "",
+            stream = "",
+          }
+        }
+      }
+
+      stage.match {
+        selector = "{tmp_container_runtime=\"docker\"}"
+        stage.docker {}
+        stage.labels {
+          values = {
+            stream = "",
+          }
+        }
+      }
+
+      stage.label_drop {
+        values = ["tmp_container_runtime"] // Drop temporary label after use
+      }
+
+      // Process NGINX-specific logs from specific namespaces
+      stage.match {
+        selector = "{namespace=~\"(monitring|default)\"}" // Apply regex parsing only to these namespaces
+        stage.regex {
+          expression = "(?P<method>GET|PUT|DELETE|POST)"
+        }
+        stage.regex {
+          expression = "(?P<status_code_with_http_version>HTTP.{6}\\d{3})"
+        }
+        stage.regex {
+          expression = "(?P<status_code>\\d{3})"
+          source = "status_code_with_http_version"
+        }
+        stage.labels {
+          values = {
+            method = "",
+            status_code = "",
+          }
+        }
+      }
+
+      stage.json {
+        expressions = {
+          level     = "level",
+          app       = "app",
+          env       = "env",
+          message   = "message",
+        }
+        // Uncomment below if you want to drop the original JSON log line once parsed
+        // action = "drop"
+      }
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    loki.process "cluster_events" {
+      // ENHANCEMENT: Add static labels to Kubernetes events for better filtering
+      stage.static_labels {
+        values = {
+          cluster = "MillenniumFalcon",
+          event_type = "kubernetes", // Label to clearly identify these as K8s events
+        }
+      }
+      forward_to = [loki.write.loki.receiver]
+    }
+
+    // Writes all processed logs to Loki via HTTP
+    loki.write "loki" {
+      endpoint {
+        url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+        headers = {
+          "Authorization" = "Basic bG9raS1jYW5hcnk6bG9raS1jYW5hcnk=",
+          "X-Scope-OrgID" = "tenant1",
+        }
+      }
+    }
+
+    livedebugging {
+      enabled = true
+    }
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: alloy-logs
+
+
+
+  # kubectl create namespace alloy-logs
+
+  # kubectl apply -f alloy-logs-configMap.yml
+
+  # helm repo add grafana https:grafana.github.io/helm-charts
+  # helm repo update
+
+  # helm upgrade --install grafana-alloy grafana/alloy -f alloy-override-values.yaml --namespace alloy-logs
+
+  # kubectl get pods -n alloy-logs -l app.kubernetes.io/name=grafana-alloy
+  # kubectl logs -n alloy-logs -l app.kubernetes.io/name=grafana-alloy --tail=100

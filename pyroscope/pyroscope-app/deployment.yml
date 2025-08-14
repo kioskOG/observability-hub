@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-python-app
+  namespace: default
+  labels:
+    app.kubernetes.io/name: otel-python-app # <--- IMPORTANT: This label matches service.name in OTel
+    app.kubernetes.io/instance: otel-python-app-instance
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-python-app
+  template:
+    metadata:
+      # annotations:
+      #   pyroscope.io/scrape: "true"
+      #   pyroscope.io/port: "8080"
+      #   pyroscope.io/profile_path: "/debug/pprof/profile"
+      #   pyroscope.io/profile_path_allocs: "/debug/pprof/allocs"
+      #   pyroscope.io/service_name: "otel-python-app"
+      labels:
+        app.kubernetes.io/name: otel-python-app
+        app.kubernetes.io/instance: otel-python-app-instance
+        app.kubernetes.io/version: "1.0.0"
+    spec:
+      containers:
+      - name: otel-python-app-container
+        image: jatin560/tempo-traces-flask-app:v14 #jatin560/tempo-traces-flask-app:v12 #jatin560/tempo-traces-flask-app:v5
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        # --- OpenTelemetry Configuration ---
+        - name: OTEL_TRACES_EXPORTER
+          value: "otlp_proto_grpc"
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: "grpc"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://grafana-alloy.alloy-logs.svc.cluster.local:4317"
+        - name: OTEL_EXPORTER_OTLP_INSECURE
+          value: "true"
+        - name: PYROSCOPE_APPLICATION_NAME
+          value: "otel-python-app"
+        - name: PYROSCOPE_SERVER_ADDRESS
+          # Point to the Alloy Service and its NEW Pyroscope ingest port (4041)
+          value: "http://grafana-alloy.alloy-logs.svc.cluster.local:4041"
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: otel-python-app
+spec:
+  selector:
+    app.kubernetes.io/name: otel-python-app
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080

@@ -1,0 +1,510 @@
+// Production-Ready Grafana Alloy Configuration
+
+// ---------------------------------------------------------------------------------------------------
+// 1. Discovery and Relabeling (Logs)
+// Best Practice: Explicitly define target namespaces and use robust relabeling rules.
+// Reference: https://grafana.com/docs/alloy/latest/concepts/relabeling/
+// Reference: https://grafana.com/docs/alloy/latest/collect/kubernetes/
+// ---------------------------------------------------------------------------------------------------
+discovery.kubernetes "pods" {
+  role = "pod"
+  // For production, avoid collecting from ALL namespaces by default.
+  // Explicitly list or use selectors to target relevant namespaces/labels.
+  // Example: target 'production' or 'default' if that's where your apps are.
+  namespaces {
+    own_namespace = false // Set to true if Alloy should only discover pods in its own namespace
+
+    // In a production environment, you typically don't want to blindly collect from "default".
+    // List specific application namespaces or use label selectors below.
+    // If you need to collect from ALL namespaces, be aware of the volume.
+    // names = ["your-app-ns-1", "your-app-ns-2", "monitoring"]
+  }
+
+  // Use selectors to target specific pods based on labels, especially in large clusters.
+  // This reduces the load on discovery and ensures you only collect from relevant sources.
+  // selectors {
+  //   role = "pod"
+  //   label = "environment in (production, staging)" // Example: target specific environments
+  //   field = "status.phase=Running" // Only collect from running pods
+  // }
+}
+
+discovery.relabel "pod_logs_base_labels" { // Renamed for clarity on its purpose
+  targets = discovery.kubernetes.pods.targets
+
+  // Standard Kubernetes labels - good practice
+  rule { source_labels = ["__meta_kubernetes_namespace"]; target_label = "namespace" }
+  rule { source_labels = ["__meta_kubernetes_pod_name"]; target_label = "pod" }
+  rule { source_labels = ["__meta_kubernetes_pod_container_name"]; target_label = "container" }
+
+  // Use common app labels if available (e.g., app.kubernetes.io/name)
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+    action        = "replace"
+    target_label  = "app" // Promote common label to 'app'
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_label_app"] // Fallback for older apps
+    action        = "replace"
+    target_label  = "app"
+    regex         = ".+" // Ensure it only replaces if the label exists
+  }
+
+  // Unique job label for each pod/container combination
+  rule {
+    source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name", "__meta_kubernetes_pod_container_name"]
+    separator     = "/"
+    target_label  = "job" // Uniquely identifies the log stream source
+  }
+
+  rule { source_labels = ["__meta_kubernetes_node_name"]; target_label = "node" }
+
+  // Crucial for Loki file discovery (CRI-O/Docker container logs)
+  rule {
+    source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+    separator     = "/"
+    action        = "replace"
+    // Use the actual container ID for robust path matching (more reliable than glob for CRI)
+    // You might need an additional relabel rule to extract the container ID if not directly available.
+    // For standard Docker/containerd, this glob should still work for most cases.
+    replacement   = "/var/log/pods/*$1/*.log"
+    target_label  = "__path__"
+  }
+
+  // Extract container runtime for `loki.process`
+  rule {
+    action        = "replace"
+    source_labels = ["__meta_kubernetes_pod_container_id"]
+    regex         = "^(\\\\w+):\\/\\/.+$"
+    replacement   = "$1"
+    target_label  = "tmp_container_runtime"
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 2. Alloy Self-Monitoring (Metrics)
+// Best Practice: Monitor your agent itself to ensure it's healthy.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/prometheus.exporter.self/
+// ---------------------------------------------------------------------------------------------------
+prometheus.exporter.self "default" {}
+
+prometheus.scrape "metamonitoring" {
+  targets    = prometheus.exporter.self.default.targets
+  // Add more robust error handling and retry configuration for production
+  // Reference: https://grafana.com/docs/alloy/latest/reference/components/prometheus.remote_write/
+  forward_to = [prometheus.remote_write.mimir.receiver]
+  scrape_interval = "30s" // Explicitly set scrape interval for clarity
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 3. Centralized Logging Configuration
+// Best Practice: Define log level, format, and ensure sufficient logging for Alloy itself.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/logging/
+// ---------------------------------------------------------------------------------------------------
+logging {
+  level    = "info" // Set to "info" for production for better visibility, "warn" can hide important details
+  format   = "json" // JSON is good for structured logging and easier parsing by Loki
+  write_to = [loki.write.alloy_logs.receiver] // Forward Alloy's logs to Loki
+}
+
+// Separate loki.write for Alloy's own logs to avoid circular dependencies and specific labels
+loki.write "alloy_logs" {
+  endpoint {
+    url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+    headers = {
+      "Authorization" = "Basic bG9raS1jYW5hcnk6bG9raS1jYW5hcnk=", // Consider Kubernetes Secrets for auth
+      "X-Scope-OrgID" = "tenant1",
+    }
+  }
+  // Add retry and queue settings for production robustness
+  // Reference: https://grafana.com/docs/alloy/latest/reference/components/loki.write/#arguments
+  queue_config {
+    capacity = 10_000 // Buffer more log entries
+    max_retries = 10
+    min_period = "1s"
+    max_period = "5s"
+  }
+  batch {
+    batch_wait = "5s"
+    batch_size = 1_048_576 // 1MB batch size
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 4. Tracing Configuration (Uncommented and Enhanced)
+// Best Practice: Enable tracing for distributed context and integrate with Tempo.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/tracing/
+// ---------------------------------------------------------------------------------------------------
+tracing {
+  sampling_fraction = 0.01 // Adjust based on traffic and Tempo ingestion limits (e.g., 1% or 0.1%)
+  write_to          = [otelcol.exporter.otlp.tempo_agent.input] // Use otelcol.exporter for more control
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 5. Node/System Logs Collection
+// Best Practice: Securely mount volumes and ensure correct path targeting.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/local.file_match/
+// ---------------------------------------------------------------------------------------------------
+local.file_match "node_logs" {
+  path_targets = [{
+    __path__  = "/var/log/syslog", // Be cautious: Syslog paths vary by OS. Check your node's setup.
+    job       = "node/syslog",
+    node_name = sys.env("HOSTNAME"),
+    cluster   = "MillenniumFalcon", // Make this configurable via environment variables
+  }]
+}
+
+loki.source.file "node_logs" {
+  targets    = local.file_match.node_logs.targets
+  forward_to = [loki.write.loki_main.receiver] // Use the main Loki write pipeline
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 6. Pods Logs Collection
+// Best Practice: Comprehensive relabeling, robust processing, and handling various log formats.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/loki.source.file/
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/loki.process/
+// Reference: https://grafana.com/docs/alloy/latest/operate/log-collection/
+// ---------------------------------------------------------------------------------------------------
+local.file_match "pod_logs" {
+  path_targets = discovery.relabel.pod_logs_base_labels.output
+}
+
+loki.source.file "pod_logs" {
+  targets    = local.file_match.pod_logs.targets
+  forward_to = [loki.process.pod_logs.receiver]
+}
+
+loki.process "pod_logs" {
+  // Use `env` to pass cluster name for easier multi-cluster setup
+  stage.static_labels {
+    values = {
+      cluster = env("CLUSTER_NAME", "MillenniumFalcon"), // Make cluster name configurable
+    }
+  }
+
+  // Match and parse CRI logs (containerd/CRI-O)
+  stage.match {
+    selector = "{tmp_container_runtime=\"containerd\"}"
+    stage.cri {}
+    stage.labels {
+      // Ensure flags and stream are correctly extracted or defaulted.
+      // These are often part of the CRI format.
+      values = {
+        flags  = "",
+        stream = "",
+      }
+    }
+  }
+
+  // Match and parse Docker logs
+  stage.match {
+    selector = "{tmp_container_runtime=\"docker\"}"
+    stage.docker {}
+    stage.labels {
+      values = {
+        stream = "",
+      }
+    }
+  }
+
+  // Drop temporary label after use
+  stage.label_drop {
+    values = ["tmp_container_runtime"]
+  }
+
+  // Regex for HTTP methods and status codes - good for application logs
+  // Consider pre-filtering to apply this regex only to relevant log streams.
+  // For example, if only web servers emit these.
+  stage.match {
+    selector = "{namespace=~\"(monitoring|default|your-app-ns-regex)\"}" // Limit where this processing applies
+    stage.regex {
+      expression = "(?P<method>GET|PUT|DELETE|POST)"
+    }
+    stage.regex {
+      expression = "(?P<status_code_with_http_version>HTTP.{6}\\d{3})"
+    }
+    stage.regex {
+      expression = "(?P<status_code>\\d{3})"
+      source     = "status_code_with_http_version"
+    }
+    stage.labels {
+      values = {
+        method      = "",
+        status_code = "",
+      }
+    }
+  }
+
+  // JSON parsing - crucial for structured logs
+  // Best Practice: Always aim for structured (JSON) logs from applications.
+  stage.json {
+    expressions = {
+      level   = "level",
+      app     = "app", // If 'app' label is already set, this might override
+      env     = "env",
+      message = "message",
+      // Add other common JSON fields here:
+      // error = "error",
+      // duration = "duration_ms",
+    }
+  }
+
+  // Trace/Span ID extraction from unstructured logs
+  // Best Practice: Prefer structured logging for trace/span IDs. This regex is a good fallback.
+  stage.regex {
+    expression = "(?:trace_id|TraceID|traceID)[^a-zA-Z0-9]*(?P<trace_id>[0-9a-fA-F]{32})|(?:span_id|SpanID|spanID)[^a-zA-Z0-9]*(?P<span_id>[0-9a-fA-F]{16})"
+  }
+
+  stage.labels {
+    values = {
+      trace_id = "",
+      span_id  = "",
+    }
+  }
+
+  forward_to = [loki.write.loki_main.receiver] // Forward processed logs to the main Loki write
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 7. Kubernetes Cluster Events Collection
+// Best Practice: Monitor cluster events for operational awareness.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/loki.source.kubernetes_events/
+// ---------------------------------------------------------------------------------------------------
+loki.source.kubernetes_events "cluster_events" {
+  job_name   = "integrations/kubernetes/eventhandler"
+  log_format = "logfmt" // logfmt is common for events, but JSON is also good if you process them later.
+  forward_to = [loki.process.cluster_events.receiver]
+}
+
+loki.process "cluster_events" {
+  stage.static_labels {
+    values = {
+      cluster     = env("CLUSTER_NAME", "MillenniumFalcon"), // Consistent cluster label
+      event_type  = "kubernetes",
+    }
+  }
+  // Add other processing stages if needed for events (e.g., JSON parsing for event data)
+  forward_to = [loki.write.loki_main.receiver]
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 8. Loki Write Configuration (Main Logs)
+// Best Practice: Robust retry and queue settings, secure authentication.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/loki.write/
+// ---------------------------------------------------------------------------------------------------
+loki.write "loki_main" { // Renamed for clarity, differentiating from alloy_logs
+  endpoint {
+    url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+    // Best Practice: Use Kubernetes Secrets for sensitive credentials instead of hardcoding.
+    // Example: "Authorization" = "Basic " + base64.encode(kube_secret("loki-creds", "auth", "loki").data["username"] + ":" + kube_secret("loki-creds", "auth", "loki").data["password"])
+    headers = {
+      "Authorization" = "Basic bG9raS1jYW5hcnk6bG9raS1jYW5hcnk=",
+      "X-Scope-OrgID" = "tenant1", // Make this configurable via env var for multi-tenancy
+    }
+    // Consider adding timeout
+    // timeout = "10s"
+  }
+  // Essential for production: buffer and retry logic to handle Loki unavailability
+  queue_config {
+    capacity = 100_000 // Increase buffer capacity for high-volume environments
+    max_retries = 20    // More retries
+    min_period = "1s"
+    max_period = "30s"
+  }
+  batch {
+    batch_wait = "5s"
+    batch_size = 4_194_304 // 4MB batch size, typical for production Loki pushing
+  }
+  // Consider using TLS if Loki is not in the same mesh or insecure connections are disallowed.
+  // tls {
+  //   insecure_skip_verify = true
+  // }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 9. OpenTelemetry Collector Pipeline
+// Best Practice: Comprehensive processing, batching, and secure exporting.
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/otelcol.receiver.otlp/
+// Reference: https://grafana.com/docs/alloy/latest/reference/components/otelcol.processor/
+// ---------------------------------------------------------------------------------------------------
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+    // Add max_recv_msg_size and max_send_msg_size for large traces
+    // max_recv_msg_size = 10_485_760 // 10MB
+  }
+  http {
+    // Add max_request_body_size for large traces via HTTP
+    // max_request_body_size = "10MB"
+  }
+
+  output {
+    traces = [
+      otelcol.processor.k8sattributes.default.input,
+      otelcol.connector.spanlogs.default.input,
+      otelcol.connector.spanmetrics.default.input,
+      otelcol.connector.servicegraph.default.input,
+    ]
+  }
+}
+
+otelcol.processor.k8sattributes "default" {
+  extract {
+    metadata = [
+      "k8s.namespace.name",
+      "k8s.pod.name",
+      "k8s.container.name",
+      "k8s.deployment.name",
+      "k8s.statefulset.name",
+      "k8s.daemonset.name",
+      "k8s.node.name", // Add node name for better context
+      "k8s.cluster.name", // If you pass this as an env var to Alloy
+    ]
+    // Add resource_attributes if you want to extract these and keep them on traces
+    // resource_attributes = [
+    //   "host.arch",
+    //   "os.type",
+    // ]
+  }
+  // Best practice: Add a cache for k8s attributes to reduce API server load.
+  cache {
+    ttl = "5m"
+  }
+  passthrough = true // Keep original resource attributes if needed
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.connector.spanmetrics "default" {
+  dimension { name = "http.method"; default = "GET" }
+  dimension { name = "http.target" }
+  dimension { name = "service.name" } // Ensure service.name is explicitly defined too if it's not default for spanmetrics
+  dimension { name = "span.kind" } // Crucial for understanding server/client behavior
+  dimension { name = "status.code" } // For error rates
+  dimension { name = "error"; default = "false" } // For explicit error flagging
+
+  aggregation_temporality = "DELTA"
+
+  histogram {
+    explicit {
+      buckets = ["50ms", "100ms", "250ms", "1s", "5s", "10s"]
+    }
+  }
+
+  metrics_flush_interval = "15s"
+  namespace              = "traces.spanmetrics"
+
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.connector.servicegraph "default" {
+  // Ensure these dimensions are actually present on your spans
+  dimensions = ["http.method", "http.target", "service.name"]
+  // Consider adding 'status.code' or 'error' dimension for service graph
+  // dimensions = ["http.method", "http.target", "service.name", "status.code", "error"]
+
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  // Batching is crucial for efficiency and reducing load on downstream systems.
+  // Adjust batch_size and timeout based on expected volume and latency requirements.
+  timeout = "5s" // Flush after 5s even if batch_size not reached
+  send_batch_size = 1000 // Number of spans in a batch
+  send_batch_max_size = 2000 // Max number of spans
+  
+  output {
+    traces  = [otelcol.exporter.otlp.tempo_agent.input] // Use Tempo agent exporter
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.remote_write.mimir.receiver]
+  // Add retry, queue, and TLS for production
+  // Reference: https://grafana.com/docs/alloy/latest/reference/components/prometheus.remote_write/
+  // queue_config: { capacity: 10_000, max_retries: 10 }
+  // tls: { insecure_skip_verify: true }
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "http://mimir-nginx.mimir.svc.cluster.local/api/v1/push"
+    // Best Practice: Use TLS for production Mimir endpoints
+    // tls {
+    //   insecure_skip_verify = false // Set to false if you have proper certs
+    //   ca_file = "/path/to/ca.crt" // Or use ca_pem for embedded certs
+    // }
+    // Add authentication headers if Mimir requires it (e.g., bearer tokens)
+    // headers = {
+    //   "Authorization" = "Bearer your-mimir-token"
+    // }
+    // Timeout for remote write operations
+    // remote_timeout = "30s"
+  }
+  // Consider queueing and retry config if not handled by otelcol.exporter.prometheus
+  // queue_config {
+  //   capacity = 100_000
+  //   max_samples_per_send = 500
+  //   batch_send_deadline = "5s"
+  //   max_retries = 10
+  // }
+}
+
+otelcol.connector.spanlogs "default" {
+  roots           = true
+  span_attributes = ["http.method", "http.target", "status.code", "error", "service.name", "span.name"] // Add more context
+  labels = ["trace_id", "span_id", "service.name", "status.code"] // Promote key attributes to Loki labels
+
+  output {
+    logs = [otelcol.exporter.loki.spanlogs_exporter.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo_agent" { // Renamed to clarify it's pushing to the Tempo agent
+  client {
+    endpoint = "tempo-distributor.tempo.svc.cluster.local:4317"
+    // Best Practice: Do NOT use insecure: true or insecure_skip_verify: true in production unless absolutely necessary
+    // for internal cluster communication with a service mesh handling TLS.
+    // If not using a service mesh, configure proper TLS certificates.
+    // tls {
+    //   insecure = false
+    //   insecure_skip_verify = false
+    //   ca_file = "/path/to/tempo-ca.crt"
+    // }
+    // Add authentication (e.g., basic auth or API key) if Tempo requires it
+    // auth {
+    //   authenticator = "basic_auth_credentials" // Requires a credentials component
+    // }
+  }
+  // Best Practice: Batching on exporters for efficiency
+  // queue_config {
+  //   queue_size = 10000
+  //   num_consumers = 2
+  // }
+  // retry_config {
+  //   enabled = true
+  //   initial_interval = "1s"
+  //   max_interval = "30s"
+  //   max_elapsed_time = "5m"
+  // }
+}
+
+otelcol.exporter.loki "spanlogs_exporter" {
+  forward_to = [loki.write.loki_main.receiver] // Forward span logs to the main Loki write pipeline
+  // Add retry, queue, and TLS config if not handled by loki.write.loki_main
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 10. Live Debugging (Optional for Production)
+// Best Practice: Keep disabled unless actively debugging.
+// ---------------------------------------------------------------------------------------------------
+livedebugging {
+  enabled = false // Disable in production unless actively troubleshooting
+}

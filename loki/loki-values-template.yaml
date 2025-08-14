@@ -1,0 +1,512 @@
+loki:
+  # --  Optional Loki UI: Provides access to a operators UI for Loki distributed. When enabled UI will be available at /ui/ of loki-gateway
+  ui:
+    # Disabled by default for backwards compatibility. Enable to use the Loki UI.
+    enabled: false
+    gateway:
+      # enable gateway proxying to UI under /ui
+      enabled: true
+  rulerConfig:
+    remote_write:
+      client:
+        url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+      enabled: true
+    rule_path: /var/loki/rules
+    storage:
+      local:
+        directory: /var/loki/rules
+      type: local
+    wal:
+      dir: /var/loki/ruler/wal
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: s3
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  storage_config:
+    aws:
+      region: "${region_name}" # for example, eu-west-2  
+      bucketnames: "${env_loki_chunk_bucket}" # Your actual S3 bucket name, for example, loki-aws-dev-chunks
+      s3forcepathstyle: false
+  ingester:
+      chunk_encoding: snappy
+  pattern_ingester:
+    enabled: true
+  limits_config:
+    ingestion_burst_size_mb: 6
+    ingestion_rate_mb: 4
+    max_global_streams_per_user: 15000
+    max_query_series: 500
+    reject_old_samples: false
+    reject_old_samples_max_age: 168h
+    retention_period: 24h
+    allow_structured_metadata: true
+    discover_log_levels: true
+    volume_enabled: true
+    shard_streams:
+      enabled: false
+      desired_rate: 2097152 #2MiB
+    # retention_period: 672h # 28 days retention
+  commonConfig:
+    path_prefix: /var/loki
+    replication_factor: 1
+    compactor_address: '{{ include "loki.compactorAddress" . }}'
+  compactor:
+    working_directory: /var/loki/compactor
+    retention_enabled: true
+    delete_request_store: s3
+    compaction_interval: 10m
+    retention_delete_delay: 1h
+    retention_delete_worker_count: 150
+  distributor:
+    # Number of workers to push batches to ingesters.
+    push_worker_count: 256
+    rate_store:
+      # The max number of concurrent requests to make to ingester stream apis
+      max_request_parallelism: 200
+      # The interval on which distributors will update current stream rates from ingesters.
+      stream_rate_update_interval: 1s
+      # Timeout for communication between distributors and any given ingester when updating rates
+      ingester_request_timeout: 500ms
+      # If enabled, detailed logs and spans will be emitted.
+      debug: false
+      # Customize the logging of write failures.
+    write_failures_logging:
+      # Log volume allowed (per second). Default: 1KB.
+      rate: 2KB
+      # Whether a insight=true key should be logged or not. Default: false.
+      add_insights_label: false
+    otlp_config:
+      # List of default otlp resource attributes to be picked as index labels
+      default_resource_attributes_as_index_labels: [service.name service.namespace service.instance.id deployment.environment deployment.environment.name cloud.region cloud.availability_zone k8s.cluster.name k8s.namespace.name k8s.pod.name k8s.container.name container.name k8s.replicaset.name k8s.deployment.name k8s.statefulset.name k8s.daemonset.name k8s.cronjob.name k8s.job.name]
+    # Enable writes to Kafka during Push requests.
+    kafka_writes_enabled: false
+    # Enable writes to Ingesters during Push requests. Defaults to true.
+    ingester_writes_enabled: true
+    # Enable checking limits against the ingest-limits service. Defaults to false.
+    ingest_limits_enabled: false
+    # Enable dry-run mode where limits are checked the ingest-limits service, but not enforced. Defaults to false.
+    ingest_limits_dry_run_enabled: false
+
+  ruler:
+    enable_api: true
+    storage:
+      type: s3
+      s3:
+        region: "${region_name}" # for example, eu-west-2
+        bucketnames: "${env_loki_ruler_bucket}" # Your actual S3 bucket name, for example, loki-aws-dev-ruler
+        s3forcepathstyle: false
+      alertmanager_url: http://prom:9093 # The URL of the Alertmanager to send alerts (Prometheus, Mimir, etc.)
+
+  querier:
+      max_concurrent: 4
+
+  storage:
+      type: s3
+      bucketNames:
+        chunks: "${region_name}" # Your actual S3 bucket name (loki-aws-dev-chunks)
+        ruler: "${env_loki_ruler_bucket}" # Your actual S3 bucket name (loki-aws-dev-ruler)
+        # admin: "<Insert s3 bucket name>" # Your actual S3 bucket name (loki-aws-dev-admin) - GEL customers only
+      s3:
+        region: "${region_name}" # eu-west-2
+        #insecure: false
+      # s3forcepathstyle: false  
+
+  memcached:
+    chunk_cache:
+      enabled: true
+      host: loki-chunks-cache #chunk-cache-memcached.loki.svc
+      service: memcached-client
+      batch_size: 256
+      parallelism: 10
+    results_cache:
+      enabled: true
+      host: loki-results-cache #results-cache-memcached.loki.svc
+      service: memcached-client
+      default_validity: 12h
+
+serviceAccount:
+ create: true
+ annotations:
+   "eks.amazonaws.com/role-arn": "${loki_role_arn}" # The service role you created
+
+deploymentMode: Distributed
+
+#ingester
+ingester:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  terminationGracePeriodSeconds: 300
+  replicas: 2 #3
+  serviceLabels:
+    release: kube-prometheus-stack
+  persistence:
+    enabled: true
+    size: 5Gi #50Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: gp2-standard
+  maxUnavailable: 1 
+  zoneAwareReplication:
+    enabled: false
+    maxUnavailablePct: 33 # -- The percent of replicas in each zone that will be restarted at once. In a value of 0-100
+
+patternIngester:
+  # -- Number of replicas for the pattern ingester
+  replicas: 1
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  serviceLabels:
+    release: kube-prometheus-stack
+  persistence:
+    enabled: true
+    size: 2Gi #10Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: gp2-standard
+
+#querier
+querier:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  replicas: 1 #3
+  maxUnavailable: 2
+  serviceLabels:
+    release: kube-prometheus-stack
+
+#queryFrontend
+queryFrontend:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  replicas: 1 #2
+  maxUnavailable: 1
+  serviceLabels:
+    release: kube-prometheus-stack
+
+#queryScheduler
+queryScheduler:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  replicas: 1 #2
+  serviceLabels:
+    release: kube-prometheus-stack
+
+#distributor
+distributor:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  replicas: 1 #3
+  maxUnavailable: 2
+  serviceLabels:
+    release: kube-prometheus-stack
+
+#compactor
+compactor:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  replicas: 1
+  serviceLabels:
+    release: kube-prometheus-stack
+  persistence:
+    enabled: true
+    size: 5Gi #10Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: gp2-standard
+
+#indexGateway
+indexGateway:
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  joinMemberlist: true
+  serviceLabels:
+    release: kube-prometheus-stack
+  replicas: 1
+  maxUnavailable: 1
+  persistence:
+    enabled: true
+    size: 5Gi #10Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: gp2-standard
+
+#ruler
+ruler:
+  replicas: 1
+  maxUnavailable: 1
+  image:
+    registry: docker.io
+    repository: grafana/loki
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: 1Gi #10Gi
+    mountPath: /var/loki
+    accessModes:
+      - ReadWriteOnce
+    storageClass: gp2-standard
+
+
+# This exposes the Loki gateway so it can be written to and queried externaly
+gateway:
+  enabled: true
+  replicas: 1
+  containerPort: 8080
+  image:
+    registry: docker.io
+    repository: nginxinc/nginx-unprivileged
+    tag: 1.28-alpine
+    pullPolicy: IfNotPresent
+  service:
+    # -- Port of the gateway service
+    port: 80
+    type: ClusterIP #LoadBalancer
+    labels:
+      release: kube-prometheus-stack
+  basicAuth: 
+    enabled: true
+    existingSecret: loki-basic-auth
+  nginxConfig:
+    # -- Which schema to be used when building URLs. Can be 'http' or 'https'.
+    schema: http
+    # -- Enable listener for IPv6, disable on IPv4-only systems
+    enableIPv6: true
+    # -- NGINX log format
+    logFormat: |-
+      main '$remote_addr - $remote_user [$time_local]  $status '
+              '"$request" $body_bytes_sent "$http_referer" '
+              '"$http_user_agent" "$http_x_forwarded_for"';
+    # -- Allows appending custom configuration to the server block
+    serverSnippet: ""
+    # -- Allows appending custom configuration to the http block, passed through the `tpl` function to allow templating
+    httpSnippet: >-
+      {{ if .Values.loki.tenants }}proxy_set_header X-Scope-OrgID $remote_user;{{ end }}
+    # -- Allows customizing the `client_max_body_size` directive
+    clientMaxBodySize: 4M
+    # -- Whether ssl should be appended to the listen directive of the server block or not.
+    ssl: false
+    # -- Override Read URL
+    customReadUrl: null
+    # -- Override Write URL
+    customWriteUrl: null
+    # -- Override Backend URL
+    customBackendUrl: null
+    # -- Allows overriding the DNS resolver address nginx will use.
+    resolver: ""
+    # -- Config file contents for Nginx. Passed through the `tpl` function to allow templating
+    # @default -- See values.yaml
+    file: |
+      {{- include "loki.nginxFile" . | indent 2 -}}
+    
+# Since we are using basic auth, we need to pass the username and password to the canary
+lokiCanary:
+  enabled: true
+  # -- If true, the canary will send directly to Loki via the address configured for verification --
+  # -- If false, it will write to stdout and an Agent will be needed to scrape and send the logs --
+  push: true
+  image:
+    registry: docker.io
+    repository: grafana/loki-canary
+    tag: 3.5.1
+    pullPolicy: IfNotPresent
+  extraArgs:
+    - -pass=$(LOKI_PASS)
+    - -user=$(LOKI_USER)
+  extraEnv:
+    - name: LOKI_PASS
+      valueFrom:
+        secretKeyRef:
+          name: canary-basic-auth
+          key: password
+    - name: LOKI_USER
+      valueFrom:
+        secretKeyRef:
+          name: canary-basic-auth
+          key: username
+
+# Enable minio for storage
+minio:
+  enabled: false
+
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+
+singleBinary:
+  replicas: 0
+
+resultsCache:
+  enabled: true
+  image:
+    repository: memcached
+    tag: 1.6.38-alpine
+    pullPolicy: IfNotPresent
+  defaultValidity: 12h
+  timeout: 500ms
+  replicas: 1
+  podDisruptionBudget:
+    maxUnavailable: 1
+  # -- Port of the results-cache service
+  port: 11211
+  # -- Amount of memory allocated to results-cache for object storage (in MB).
+  allocatedMemory: 512 #1024
+  # -- Maximum item results-cache for memcached (in MB).
+  maxItemMemory: 5
+  # -- Maximum number of connections allowed
+  connectionLimit: 16384
+  # -- Max memory to use for cache write back
+  writebackSizeLimit: 500MB
+  # -- Max number of objects to use for cache write back
+  writebackBuffer: 500000
+  # -- Number of parallel threads for cache write back
+  writebackParallelism: 1
+
+chunksCache:
+  enabled: true
+  image:
+    repository: memcached
+    tag: 1.6.38-alpine
+    pullPolicy: IfNotPresent
+  batchSize: 4
+  parallelism: 5
+  timeout: 2000ms
+  defaultValidity: 0s
+  # -- Total number of chunks-cache replicas
+  replicas: 1
+  # -- Port of the chunks-cache service
+  port: 11211
+  # -- Amount of memory allocated to chunks-cache for object storage (in MB).
+  allocatedMemory: 512 #8192  # resources limit & request of memcached object is calculated using allocatedMemory * 1.2
+  # -- Maximum item memory for chunks-cache (in MB).
+  maxItemMemory: 5
+  # -- Maximum number of connections allowed
+  connectionLimit: 16384
+  # -- Max memory to use for cache write back
+  writebackSizeLimit: 500MB
+  # -- Max number of objects to use for cache write back
+  writebackBuffer: 500000
+  # -- Number of parallel threads for cache write back
+  writebackParallelism: 1
+
+memcached:
+  image:
+    repository: memcached
+    tag: 1.6.38-alpine
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi #9830Mi
+    limits:
+      memory: 1024Mi #9830Mi
+  # -- The SecurityContext override for memcached pods
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 11211
+    runAsGroup: 11211
+    fsGroup: 11211
+  # -- The name of the PriorityClass for memcached pods
+  priorityClassName: null
+  # -- The SecurityContext for memcached containers
+  containerSecurityContext:
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+    allowPrivilegeEscalation: false
+
+memcachedExporter:
+  # -- Whether memcached metrics should be exported
+  enabled: true
+  image:
+    repository: prom/memcached-exporter
+    tag: v0.15.2
+    pullPolicy: IfNotPresent
+  # resources:
+  #   requests: {}
+  #   limits: {}
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi #9830Mi
+    limits:
+      memory: 1024Mi
+  # -- The SecurityContext for memcached exporter containers
+  containerSecurityContext:
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+    allowPrivilegeEscalation: false
+  # -- Extra args to add to the exporter container.
+  # Example:
+  # extraArgs:
+  #   memcached.tls.enable: true
+  #   memcached.tls.cert-file: /certs/cert.crt
+  #   memcached.tls.key-file: /certs/cert.key
+  #   memcached.tls.ca-file: /certs/ca.crt
+  #   memcached.tls.insecure-skip-verify: false
+  #   memcached.tls.server-name: memcached
+  extraArgs: {}
+
+# Configuration for the memberlist service
+memberlist:
+  service:
+    publishNotReadyAddresses: false
+
+rollout_operator:
+# -- Enable rollout-operator. It must be enabled when using Zone Aware Replication.
+  enabled: false
+
+  podSecurityContext:
+    fsGroup: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Set the container security context
+  securityContext:
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+    allowPrivilegeEscalation: false
+
+
+# helm upgrade --install loki grafana/loki -n loki --create-namespace --values "./loki/loki-override-values.yaml"

@@ -1,0 +1,262 @@
+# -- Overrides the chart's namespace.
+namespaceOverride: null
+
+crds:
+  # -- Whether to install CRDs for monitoring.
+  create: true
+
+## Various Alloy settings. For backwards compatibility with the grafana-agent
+## chart, this field may also be called "agent". Naming this field "agent" is
+## deprecated and will be removed in a future release.
+alloy:
+  extraPorts:
+    - name: otlp-grpc # The default port for otlp-grpc is 4317, so you need to add this port to the service related to your alloy instance
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http # The default port for otlp-http is 4318, so you need to add this port to the service related to your alloy instance
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+    - name: pyroscope
+      port: 4041
+      targetPort: 4041
+      protocol: TCP
+  configMap:
+    # -- Create a new ConfigMap for the config file.
+    create: false
+    # -- Content to assign to the new ConfigMap.  This is passed into `tpl` allowing for templating from values.
+    content: ''
+
+    # -- Name of existing ConfigMap to use. Used when create is false.
+    name: alloy-config
+    # -- Key in ConfigMap to get config from.
+    key: config.alloy
+  
+  # https://grafana.com/docs/alloy/latest/get-started/clustering/#do-not-enable-clustering-when-you-dont-need-it
+  clustering:
+    # -- Deploy Alloy in a cluster to allow for load distribution.
+    enabled: false
+
+    # -- Name for the Alloy cluster. Used for differentiating between clusters.
+    name: ""
+
+    # -- Name for the port used for clustering, useful if running inside an Istio Mesh
+    portName: http
+
+  # -- Minimum stability level of components and behavior to enable. Must be
+  # one of "experimental", "public-preview", or "generally-available".
+  stabilityLevel: "public-preview" #"generally-available"
+  # note we are running alloy in "public-preview" due to pyroscope as it is in preview phase.
+
+  # -- Path to where Grafana Alloy stores data (for example, the Write-Ahead Log).
+  # By default, data is lost between reboots.
+  storagePath: /tmp/alloy
+
+  # -- Address to listen for traffic on. 0.0.0.0 exposes the UI to other
+  # containers.
+  listenAddr: 0.0.0.0
+
+  # -- Port to listen for traffic on.
+  listenPort: 12345
+
+  # -- Scheme is needed for readiness probes. If enabling tls in your configs, set to "HTTPS"
+  listenScheme: HTTP
+
+  # --  Base path where the UI is exposed.
+  uiPathPrefix: /
+
+  # -- Enables sending Grafana Labs anonymous usage stats to help improve Grafana
+  # Alloy.
+  enableReporting: false
+
+  # -- Extra environment variables to pass to the Alloy container.
+  extraEnv:
+    - name: KUBE_CLUSTER_NAME
+      value: "MillenniumFalcon"
+    - name: ENVIRONMENT_NAME
+      value: "Production"
+    - name: AWS_REGION
+      value: "ap-southeast-1"
+    - name: CLOUD_PROVIDER
+      value: "aws"
+    - name: PLATFORM_TYPE
+      value: "eks"
+    # Make sure to include the HOSTNAME env var if you were relying on it for node_name
+    - name: KUBE_NODE_NAME # This replaces the `HOSTNAME` env var from previous config
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+
+  mounts:
+    # -- Mount /var/log from the host into the container for log collection.
+    varlog: true
+    # -- Mount /var/lib/docker/containers from the host into the container for log
+    # collection.
+    dockercontainers: true
+
+    # -- Extra volume mounts to add into the Grafana Alloy container. Does not
+    # affect the watch container.
+    extra: []
+      # - name: varlogjournal
+      #   mountPath: /var/log/journal
+      #   readOnly: true
+
+  # -- Security context to apply to the Grafana Alloy container.
+  # We are running this in privilege mode due to ebpf profiling.
+  securityContext:
+    privileged: true
+    runAsGroup: 0
+    runAsUser: 0
+
+  # -- Resource requests and limits to apply to the Grafana Alloy container.
+  resources:
+    limits:
+      # cpu: "500m"
+      memory: "500Mi"
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+
+
+  # -- Set lifecycle hooks for the Grafana Alloy container.
+  lifecycle: {}
+    # preStop:
+    #   exec:
+    #     command:
+    #     - /bin/sleep
+    #     - "10"
+
+  # -- Set livenessProbe for the Grafana Alloy container.
+  livenessProbe:
+    httpGet:
+      path: /-/healthy
+      port: 12345
+  readinessProbe:
+    httpGet:
+      path: /-/ready
+      port: 12345
+
+
+image:
+  # -- Grafana Alloy image registry (defaults to docker.io)
+  registry: "docker.io"
+  # -- Grafana Alloy image repository.
+  repository: grafana/alloy
+  # -- (string) Grafana Alloy image tag. When empty, the Chart's appVersion is
+  # used.
+  tag: null
+  # -- Grafana Alloy image's SHA256 digest (either in format "sha256:XYZ" or "XYZ"). When set, will override `image.tag`.
+  digest: null
+  # -- Grafana Alloy image pull policy.
+  pullPolicy: IfNotPresent
+  # -- Optional set of image pull secrets.
+  pullSecrets: []
+
+rbac:
+  # -- Whether to create RBAC resources for Alloy.
+  create: true
+
+serviceAccount:
+  # -- Whether to create a service account for the Grafana Alloy deployment.
+  create: true
+  # -- Additional labels to add to the created service account.
+  additionalLabels: {}
+  # -- Annotations to add to the created service account.
+  annotations: {}
+  # -- The name of the existing service account to use when
+  # serviceAccount.create is false.
+  name: null
+  # Whether the Alloy pod should automatically mount the service account token.
+  automountServiceAccountToken: true
+
+# Options for the extra controller used for config reloading.
+configReloader:
+  # -- Enables automatically reloading when the Alloy config changes.
+  enabled: true
+  image:
+    # -- Config reloader image registry (defaults to docker.io)
+    registry: "quay.io"
+    # -- Repository to get config reloader image from.
+    repository: prometheus-operator/prometheus-config-reloader
+    # -- Tag of image to use for config reloading.
+    tag: v0.81.0
+    # -- SHA256 digest of image to use for config reloading (either in format "sha256:XYZ" or "XYZ"). When set, will override `configReloader.image.tag`
+    digest: ""
+  # -- Override the args passed to the container.
+  customArgs: []
+  # -- Resource requests and limits to apply to the config reloader container.
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "50Mi"
+  # -- Security context to apply to the Grafana configReloader container.
+  securityContext: {}
+
+controller:
+  # -- Type of controller to use for deploying Grafana Alloy in the cluster.
+  # Must be one of 'daemonset', 'deployment', or 'statefulset'.
+  hostPID: true
+  type: 'daemonset'
+
+  # -- Number of pods to deploy. Ignored when controller.type is 'daemonset'.
+  replicas: 1
+
+  # -- Annotations to add to controller.
+  extraAnnotations: {}
+
+  # -- Whether to deploy pods in parallel. Only used when controller.type is
+  # 'statefulset'.
+  parallelRollout: true
+
+  volumes:
+    # -- Extra volumes to add to the Grafana Alloy pod.
+    extra: []
+      # - name: varlogjournal
+      #   hostPath:
+      #     path: /var/log/journal
+
+
+  # -- Additional containers to run alongside the Alloy container and initContainers.
+  extraContainers: []
+
+service:
+  # -- Creates a Service for the controller's pods.
+  enabled: true
+  # -- Service type
+  type: ClusterIP
+  # -- NodePort port. Only takes effect when `service.type: NodePort`
+  nodePort: 31128
+  # -- Cluster IP, can be set to None, empty "" or an IP address
+  clusterIP: ''
+  # -- Value for internal traffic policy. 'Cluster' or 'Local'
+  internalTrafficPolicy: Cluster
+  annotations: {}
+    # cloud.google.com/load-balancer-type: Internal
+
+serviceMonitor:
+  enabled: true
+  # -- Additional labels for the service monitor.
+  additionalLabels:
+    release: kube-prometheus-stack
+  # -- Scrape interval. If not set, the Prometheus default scrape interval is used.
+  interval: ""
+  # -- MetricRelabelConfigs to apply to samples after scraping, but before ingestion.
+  # ref: https://github.com/prometheus-operator/prometheus-operator/blob/main/Documentation/api.md#relabelconfig
+  metricRelabelings: []
+  # - action: keep
+  #   regex: 'kube_(daemonset|deployment|pod|namespace|node|statefulset).+'
+  #   sourceLabels: [__name__]
+
+  # -- Customize tls parameters for the service monitor
+  tlsConfig: {}
+
+  # -- RelabelConfigs to apply to samples before scraping
+  # ref: https://github.com/prometheus-operator/prometheus-operator/blob/main/Documentation/api.md#relabelconfig
+  relabelings: []
+  # - sourceLabels: [__meta_kubernetes_pod_node_name]
+  #   separator: ;
+  #   regex: ^(.*)$
+  #   targetLabel: nodename
+  #   replacement: $1
+  #   action: replace

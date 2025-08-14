@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rider
+  namespace: default
+  labels:
+    app.kubernetes.io/name: rider # <--- IMPORTANT: This label matches service.name in OTel
+    app.kubernetes.io/instance: rider-instance
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rider
+  template:
+    metadata:
+      # annotations:
+      #   pyroscope.io/scrape: "true"
+      #   pyroscope.io/port: "8080"
+      #   pyroscope.io/profile_path: "/debug/pprof/profile"
+      #   pyroscope.io/profile_path_allocs: "/debug/pprof/allocs"
+      #   pyroscope.io/service_name: "rider"
+      labels:
+        app.kubernetes.io/name: rider
+        app.kubernetes.io/instance: rider-instance
+        app.kubernetes.io/version: "1.0.0"
+    spec:
+      containers:
+      - name: rider-container
+        image: rkathal/pyroscope-rider-go:v3 #jatin560/tempo-traces-flask-app:v12 #jatin560/tempo-traces-flask-app:v5
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        # --- OpenTelemetry Configuration ---
+        - name: OTEL_TRACES_EXPORTER
+          value: "otlp_proto_grpc"
+        - name: REGION
+          value: "us-east"
+        - name: PARAMETERS_POOL_SIZE
+          value: "1000"
+        - name: PARAMETERS_POOL_BUFFER_SIZE_KB
+          value: "1000"
+        - name: OTEL_EXPORTER_OTLP_PROTOCOL
+          value: "grpc"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://grafana-alloy.alloy-logs.svc.cluster.local:4317"
+        - name: OTEL_EXPORTER_OTLP_INSECURE
+          value: "true"
+        - name: PYROSCOPE_APPLICATION_NAME
+          value: "rider"
+        - name: PYROSCOPE_SERVER_ADDRESS
+          # Point to the Alloy Service and its NEW Pyroscope ingest port (4041)
+          value: "http://grafana-alloy.alloy-logs.svc.cluster.local:4041"
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: rider
+spec:
+  selector:
+    app.kubernetes.io/name: rider
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 5000
+

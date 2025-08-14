@@ -1,0 +1,826 @@
+global:
+  image:
+    # -- Overrides the Docker registry globally for all images, excluding enterprise.
+    registry: docker.io
+    pullSecrets: []
+    # -- Global storage class to be used for persisted components
+    storageClass: gp2-standard
+
+tempo:
+  image:
+    registry: docker.io
+    pullSecrets: []
+    repository: grafana/tempo
+    tag: 2.8.1
+    pullPolicy: IfNotPresent
+  readinessProbe:
+    httpGet:
+      path: /ready
+      port: http-metrics
+    initialDelaySeconds: 30
+    timeoutSeconds: 1
+  # -- SecurityContext holds container-level security attributes and common container settings
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+  # -- podSecurityContext holds pod-level security attributes and common container settings
+  podSecurityContext:
+    fsGroup: 1000
+  # -- Structured tempo configuration
+  structuredConfig:
+    stream_over_http_enabled: true
+  service:
+    # -- Configure the IP families for all tempo services
+    # See the Service spec for details: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#servicespec-v1-core
+    ipFamilies:
+      - 'IPv4'
+    #   - 'IPv6'
+    # -- Configure the IP family policy for all tempo services.  SingleStack, PreferDualStack or RequireDualStack
+    ipFamilyPolicy: 'SingleStack'
+
+ingester:
+  replicas: 2 #3
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+  terminationGracePeriodSeconds: 300
+  persistence:
+    enabled: true
+    size: 5Gi #50Gi
+    storageClass: gp2-standard
+  # -- topologySpread for ingester pods. Passed through `tpl` and, thus, to be configured as string
+  # @default -- Defaults to allow skew no more then 1 node per AZ
+  topologySpreadConstraints: |
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          {{- include "tempo.selectorLabels" (dict "ctx" . "component" "ingester") | nindent 6 }}
+  # -- Affinity for ingester pods. Passed through `tpl` and, thus, to be configured as string
+  # @default -- Soft node and soft zone anti-affinity
+  affinity: |
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: ingester
+            topologyKey: kubernetes.io/hostname
+        - weight: 75
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: ingester
+            topologyKey: topology.kubernetes.io/zone
+  service:
+    annotations: {}
+    type: ClusterIP
+    internalTrafficPolicy: Cluster          
+  zoneAwareReplication:
+    enabled: false
+  statefulSet:
+    enabled: true
+  config:
+    lifecycler:
+      ring:
+        kvstore:
+          store: memberlist
+          replication_factor: 2
+        tokens_file_path: /var/tempo/tokens.json
+    # -- Number of copies of spans to store in the ingester ring
+    replication_factor: 3
+    # -- Amount of time a trace must be idle before flushing it to the wal.
+    trace_idle_period: 10s
+    # -- How often to sweep all tenants and move traces from live -> wal -> completed blocks.
+    flush_check_period: null #10s
+    # -- Maximum size of a block before cutting it
+    max_block_bytes: null #524288000 = 500MB
+    # -- Maximum length of time before cutting a block
+    max_block_duration: null #30m
+    # -- Duration to keep blocks in the ingester after they have been flushed
+    # How long to hold a complete block in the ingester after it has been flushed to the backend. Default is 15m
+    complete_block_timeout: null #15s
+    # -- Flush all traces to backend when ingester is stopped
+    flush_all_on_shutdown: false
+
+
+serviceAccount:
+ create: true
+ name: tempo
+ annotations:
+   "eks.amazonaws.com/role-arn": "${tempo_role_arn}" # The service role you created
+
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: ${env_tempo_chunk_bucket}
+      endpoint: s3.${region_name}.amazonaws.com
+      region: ${region_name}
+      insecure: false
+    pool:
+      max_workers: 400
+      queue_depth: 20000
+    # The supported search are specified here https://grafana.com/docs/tempo/latest/configuration/#search-config
+    search:
+      # -- Number of traces to prefetch while scanning blocks. Increasing this value can improve trace search performance at the cost of memory.
+      prefetch_trace_count: 1000
+    # -- How often to repoll the backend for new blocks
+    blocklist_poll: 5m
+    # -- Number of blocks to process in parallel during polling. Default is 50.
+    blocklist_poll_concurrency: 50 # null
+    # -- By default components will pull the blocklist from the tenant index. If that fails the component can
+    # -- fallback to scanning the entire bucket. Set to false to disable this behavior.
+    blocklist_poll_fallback: null
+    # -- Maximum number of compactors that should build the tenant index. All other components will download the index.
+    blocklist_poll_tenant_index_builders: null
+    # -- The oldest allowable tenant index.
+    blocklist_poll_stale_tenant_index: null
+
+minio:
+  enabled: false
+
+# Specifies which trace protocols to accept by the gateway.
+traces:
+  otlp:
+    grpc:
+      enabled: true
+      # -- GRPC receiver advanced config
+      receiverConfig: {}
+    http:
+      enabled: true
+      # -- HTTP receiver advanced config
+      receiverConfig: {}
+  zipkin:
+    enabled: false
+  jaeger:
+    thriftHttp:
+      enabled: false
+  opencensus:
+    enabled: false
+
+metricsGenerator:
+  # -- Specifies whether a metrics-generator should be deployed
+  enabled: true
+  # -- Kind of deployment [StatefulSet/Deployment]
+  kind: Deployment
+  replicas: 1
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+  registry:
+    external_labels:
+      source: tempo
+  persistence:
+    # -- Enable creating PVCs if you have kind set to StatefulSet. This disables using local disk or memory configured in walEmptyDir
+    enabled: true
+    size: 2Gi
+    # -- Storage class to be used.
+    # If defined, storageClassName: <storageClass>.
+    # If set to "-", storageClassName: "", which disables dynamic provisioning.
+    # If empty or set to null, no storageClassName spec is
+    # set, choosing the default provisioner (gp2 on AWS, standard on GKE, AWS, and OpenStack).
+    storageClass: null
+  # -- The EmptyDir location where the /var/tempo will be mounted on. Defaults to local disk, can be set to memory.
+  walEmptyDir: {}
+  ports:
+    - name: grpc
+      port: 9095
+      service: true
+    - name: http-memberlist
+      port: 7946
+      service: false
+    - name: http-metrics
+      port: 3200
+      service: true
+  # -- More information on configuration: https://grafana.com/docs/tempo/latest/configuration/#metrics-generator
+  config:
+    registry:
+      collection_interval: 15s
+      external_labels: {}
+      stale_duration: 15m
+    processor:
+      # -- For processors to be enabled and generate metrics, pass the names of the processors to `overrides.defaults.metrics_generator.processors` value like `[service-graphs, span-metrics]`.
+      service_graphs:
+        # -- Additional dimensions to add to the metrics along with the default dimensions.
+        # -- The resource and span attributes to be added to the service graph metrics, if present.
+        dimensions: []
+        histogram_buckets: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8]
+        max_items: 10000
+        wait: 10s
+        workers: 10
+        enable_messaging_system_latency_histogram: true
+        enable_client_server_prefix: true
+        peer_attributes: ["peer.service", "db.name", "db.system"]
+      span_metrics:
+        # Configure intrinsic dimensions to add to the metrics. Intrinsic dimensions are taken
+        # directly from the respective resource and span properties.
+        intrinsic_dimensions:
+          # Whether to add the name of the service the span is associated with.
+          service: true
+          # Whether to add the name of the span.
+          span_name: true
+          # Whether to add the span kind describing the relationship between spans.
+          span_kind: true
+          # Whether to add the span status code.
+          status_code: true
+          # Whether to add a status message. Important note: The span status message may
+          # contain arbitrary strings and thus have a very high cardinality.
+          status_message: false
+        # -- Additional dimensions to add to the metrics along with the default dimensions.
+        # -- The resource and span attributes to be added to the span metrics, if present.
+        dimensions: []
+        histogram_buckets: [0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.02, 2.05, 4.10]
+    storage:
+      path: /var/tempo/wal
+      wal:
+      remote_write_flush_deadline: 1m
+      # Whether to add X-Scope-OrgID header in remote write requests
+      remote_write_add_org_id_header: false
+      # -- A list of remote write endpoints.
+      # -- https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write
+      remote_write: 
+      - url: "http://mimir-nginx.mimir.svc.cluster.local:80/api/v1/push"
+        basic_auth:
+          username: "mimir-nginx"
+          password: "mimir-nginx"
+      # - url: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
+        send_exemplars: true
+    # -- Used by the local blocks processor to store a wal for traces.
+    traces_storage:
+      path: /var/tempo/traces
+    metrics_ingestion_time_range_slack: 30s
+    # Timeout for metric requests
+    query_timeout: 30s
+
+overrides:
+  # Global ingestion limits configurations
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics, local-blocks]
+
+# global_overrides:
+#   metrics_generator_processors: [service-graphs, span-metrics, local-blocks] # [service-graphs, span-metrics, local-blocks]
+
+distributor:
+  replicas: 1
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+  service:
+    annotations: {}
+    labels: {}
+    type: ClusterIP
+    # -- If type is LoadBalancer you can assign the IP to the LoadBalancer
+    loadBalancerIP: ''
+    # -- If type is LoadBalancer limit incoming traffic from IPs.
+    loadBalancerSourceRanges: []
+    # -- If type is LoadBalancer you can set it to 'Local' [preserve the client source IP](https://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip)
+    externalTrafficPolicy: null
+    # -- https://kubernetes.io/docs/concepts/services-networking/service-traffic-policy/
+    internalTrafficPolicy: Cluster
+  maxUnavailable: 1
+  config:
+    # -- Enable to log every received span to help debug ingestion or calculate span error distributions using the logs
+    # This is not recommended for production environments
+    log_received_spans:
+      enabled: false
+      include_all_attributes: false
+      filter_by_status_error: false
+    # Enable to log every discarded span to help debug ingestion or calculate span error distributions using the logs.
+    log_discarded_spans:
+      enabled: false
+      include_all_attributes: false
+      filter_by_status_error: false
+    # Enable to metric every received span to help debug ingestion
+    # This is not recommended for production environments
+    metric_received_spans:
+      enabled: false
+      root_only: false
+    # Disables write extension with inactive ingesters. Use this along with ingester.lifecycler.unregister_on_shutdown = true
+    #  note that setting these two config values reduces tolerance to failures on rollout b/c there is always one guaranteed to be failing replica
+    extend_writes: null
+    # Configures the time to retry after returned to the client when Tempo returns a GRPC ResourceExhausted. This parameter
+    # defaults to 0 which means that by default ResourceExhausted is not retried. Set this to a duration such as `1s` to
+    # instruct the client how to retry.
+    retry_after_on_resource_exhausted: '0'
+    # Configures the max size an attribute can be. Any key or value that exceeds this limit will be truncated before storing
+    # Setting this parameter to '0' would disable this check against attribute size
+    # Use the `tempo_distributor_attributes_truncated_total` metric to track how many attributes are truncated.
+    max_attribute_bytes: '2048'
+    # Configures usage trackers in the distributor which expose metrics of ingested traffic grouped by configurable
+    # attributes exposed on /usage_metrics.
+    usage:
+      cost_attribution:
+        # Enables the "cost-attribution" usage tracker. Per-tenant attributes are configured in overrides.
+        enabled: false
+        # Maximum number of series per tenant.
+        max_cardinality: 10000
+        # Interval after which a series is considered stale and will be deleted from the registry.
+        # Once a metrics series is deleted, it won't be emitted anymore, keeping active series low.
+        stale_duration: 15m0s
+
+compactor:
+  replicas: 1
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+  maxUnavailable: 1
+  minReadySeconds: 10
+  config:
+    compaction:
+      # -- Duration to keep blocks
+      block_retention: 48h
+      # Duration to keep blocks that have been compacted elsewhere
+      # How long to leave a block in the backend after it has been compacted successfully.
+      compacted_block_retention: 1h
+      # -- Blocks in this time window will be compacted together
+      compaction_window: 1h
+      # -- Amount of data to buffer from input blocks
+      v2_in_buffer_bytes: 5242880
+      # -- Flush data to backend when buffer is this large
+      v2_out_buffer_bytes: 20971520
+      # -- Maximum number of traces in a compacted block. WARNING: Deprecated. Use max_block_bytes instead.
+      max_compaction_objects: 6000000
+      # -- Maximum size of a compacted block in bytes
+      max_block_bytes: 107374182400
+      # -- Number of tenants to process in parallel during retention
+      retention_concurrency: 10
+      # -- Number of traces to buffer in memory during compaction
+      v2_prefetch_traces_count: 1000
+      # -- The maximum amount of time to spend compacting a single tenant before moving to the next
+      max_time_per_tenant: 5m
+      # -- The time between compaction cycles
+      compaction_cycle: 30s
+
+querier:
+  replicas: 1
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+    maxUnavailable: 1
+    maxSurge: 0
+    config:
+    frontend_worker:
+      # -- grpc client configuration
+      grpc_client_config: {}
+    trace_by_id:
+      # -- Timeout for trace lookup requests
+      query_timeout: 10s
+    search:
+      # -- Timeout for search requests
+      query_timeout: 30s
+    # -- This value controls the overall number of simultaneous subqueries that the querier will service at once. It does not distinguish between the types of queries.
+    max_concurrent_queries: 20
+
+queryFrontend:
+  query:
+    # -- Required for grafana version <7.5 for compatibility with jaeger-ui. Doesn't work on ARM arch
+    enabled: false
+    replicas: 1
+    image:
+      pullSecrets: []
+      repository: grafana/tempo-query
+      tag: null
+    config: |
+      backend: 127.0.0.1:3200
+
+  config:
+    # -- Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.
+    max_outstanding_per_tenant: 2000
+    # -- Number of times to retry a request sent to a querier
+    max_retries: 2
+    # The number of jobs to batch together in one http request to the querier. Set to 1 to disable.
+    max_batch_size: 7
+    # Generally it is preferred to let the client cancel context. This is a failsafe to prevent a client
+    # from imposing more work on Tempo than desired.
+    # (default: 0)
+    api_timeout: 10
+    # Max allowed TraceQL expression size, in bytes. queries bigger then this size will be rejected. (default: 128 KiB)
+    max_query_expression_size_bytes: 131072
+  search:
+    # -- The number of concurrent jobs to execute when searching the backend
+    concurrent_jobs: 1000
+    # -- The target number of bytes for each job to handle when performing a backend search
+    target_bytes_per_job: 104857600
+    # -- The maximum allowed value of spans per span set. 0 disables this limit.
+    max_spans_per_span_set: 100
+  # -- Trace by ID lookup configuration
+  trace_by_id:
+    # -- The number of shards to split a trace by id query into.
+    query_shards: 50
+    # The maximum number of shards to execute at once. If set to 0 query_shards is used.
+    concurrent_shards: 0
+  metrics:
+    # -- The number of concurrent jobs to execute when querying the backend.
+    concurrent_jobs: 1000
+    # -- The target number of bytes for each job to handle when querying the backend.
+    target_bytes_per_job: 104857600
+    # -- The maximum allowed time range for a metrics query.
+    # 0 disables this limit.
+    max_duration: 3h
+    # -- query_backend_after controls where the query-frontend searches for traces.
+    # Time ranges older than query_backend_after will be searched in the backend/object storage only.
+    # Time ranges between query_backend_after and now will be queried from the metrics-generators.
+    query_backend_after: 30m
+    # -- The target length of time for each job to handle when querying the backend.
+    interval: 5m
+    # -- If set to a non-zero value, it's value will be used to decide if query is within SLO or not.
+    # Query is within SLO if it returned 200 within duration_slo seconds OR processed throughput_slo bytes/s data.
+    # NOTE: `duration_slo` and `throughput_bytes_slo` both must be configured for it to work
+    duration_slo: 0s
+    # -- If set to a non-zero value, it's value will be used to decide if query is within SLO or not.
+    # Query is within SLO if it returned 200 within duration_slo seconds OR processed throughput_slo bytes/s data.
+    throughput_bytes_slo: 0
+  image:
+    pullSecrets: []
+    registry: docker.io
+    repository: grafana/tempo
+    tag: 2.8.1
+  service:
+    # -- Port of the query-frontend service
+    port: 16686
+    # -- Annotations for queryFrontend service
+    annotations: {}
+    # -- Labels for queryFrontend service
+    labels: {}
+    # -- Type of service for the queryFrontend
+    type: ClusterIP
+    # -- If type is LoadBalancer you can assign the IP to the LoadBalancer
+    loadBalancerIP: ""
+    # -- If type is LoadBalancer limit incoming traffic from IPs.
+    loadBalancerSourceRanges: []
+  maxUnavailable: 1
+  minReadySeconds: 10
+
+multitenancyEnabled: false
+
+rollout_operator:
+# -- Enable rollout-operator. It must be enabled when using Zone Aware Replication.
+  enabled: false
+
+  podSecurityContext:
+    fsGroup: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+
+  # Set the container security context
+  securityContext:
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+    allowPrivilegeEscalation: false
+
+# -- Memberlist configuration. Please refer to https://grafana.com/docs/tempo/latest/configuration/#memberlist
+memberlist:
+  node_name: ""
+  cluster_label: "{{ .Release.Name }}.{{ .Release.Namespace }}"
+  randomize_node_name: true
+  stream_timeout: "10s"
+  retransmit_factor: 2
+  pull_push_interval: "30s"
+  gossip_interval: "1s"
+  gossip_nodes: 2
+  gossip_to_dead_nodes_time: "30s"
+  min_join_backoff: "1s"
+  max_join_backoff: "1m"
+  max_join_retries: 10
+  abort_if_cluster_join_fails: false
+  rejoin_interval: "0s"
+  left_ingesters_timeout: "5m"
+  leave_timeout: "5s"
+  bind_addr: []
+  bind_port: 7946
+  packet_dial_timeout: "5s"
+  packet_write_timeout: "5s"
+
+# Tempo server configuration
+server:
+  http_listen_network: tcp
+  # --  HTTP server listen host
+  httpListenPort: 3200
+  # gRPC
+  grpc_listen_network: tcp
+  # gRPC server listen port
+  grpc_listen_port: 9095
+  # Register instrumentation handlers (/metrics, etc.)
+  register_instrumentation: true
+  # Timeout for graceful shutdowns
+  graceful_shutdown_timeout: 60s
+  # Read timeout for HTTP server
+  http_server_read_timeout: 60s
+  # -- Log level. Can be set to debug, info (default), warn, error
+  logLevel: info
+  # -- Log format. Can be set to logfmt (default) or json.
+  logFormat: logfmt
+  # -- Max gRPC message size that can be received
+  grpc_server_max_recv_msg_size: 16777216
+  # -- Max gRPC message size that can be sent
+  grpc_server_max_send_msg_size: 16777216
+  # -- Write timeout for HTTP server
+  http_server_write_timeout: 30s
+
+# Use this block to configure caches available throughout the application.
+# Multiple caches can be created and assigned roles which determine how they are used by Tempo.
+# https://grafana.com/docs/tempo/latest/configuration/#cache
+cache:
+  caches:
+    - memcached:
+        host: '{{ include "tempo.fullname" . }}-memcached'
+        service: memcached-client
+        consistent_hash: true
+        timeout: 300ms
+        # Maximum number of idle connections in pool.
+        max_idle_conns: 10
+      roles:
+        - parquet-footer
+        - bloom
+        - frontend-search
+
+# memcached is for all of the Tempo pieces to coordinate with each other.
+# you can use your self memcacherd by set enable: false and host + service
+memcached:
+  # -- Specified whether the memcached cachce should be enabled
+  enabled: true
+  image:
+    # Overrides `global.image.registry`
+    registry: docker.io
+    pullSecrets: []
+    repository: memcached
+    tag: 1.6.33-alpine
+    pullPolicy: IfNotPresent
+  host: memcached
+  replicas: 1
+  maxUnavailable: 1
+  # -- configuration for readiness probe for memcached statefulset
+  readinessProbe:
+    tcpSocket:
+      port: client
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 6
+    successThreshold: 1
+
+  # -- configuration for liveness probe for memcached statefulset
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+    successThreshold: 1
+
+memcachedExporter:
+  enabled: false
+  image:
+    registry: docker.io
+    pullSecrets: []
+    repository: prom/memcached-exporter
+    tag: v0.14.4
+    pullPolicy: IfNotPresent
+  resources: {}
+  extraArgs: []
+
+metaMonitoring:
+  serviceMonitor:
+    enabled: true
+    # -- Alternative namespace for ServiceMonitor resources
+    namespace: monitoring
+    # -- Namespace selector for ServiceMonitor resources
+    namespaceSelector: null # namespace which this service will look for the services
+    annotations: {}
+    labels:
+      release: kube-prometheus-stack # label which prometheus is looking for. whether monitor this serviceMonitor or not.
+    # -- ServiceMonitor scrape interval
+    interval: 30s
+    # -- ServiceMonitor scrape timeout in Go duration format (e.g. 15s)
+    scrapeTimeout: 15s
+    scheme: http
+
+# Rules for the Prometheus Operator
+prometheusRule:
+  # -- If enabled, a PrometheusRule resource for Prometheus Operator is created
+  enabled: false
+  # -- Alternative namespace for the PrometheusRule resource
+  namespace: monitoring
+  # -- PrometheusRule annotations
+  annotations: {}
+  labels:
+      release: kube-prometheus-stack # label which prometheus is looking for. whether monitor these prometheusRule or not.
+  # -- Contents of Prometheus rules file
+  groups: []
+  # - name: loki-rules
+  #   rules:
+  #     - record: job:loki_request_duration_seconds_bucket:sum_rate
+  #       expr: sum(rate(loki_request_duration_seconds_bucket[1m])) by (le, job)
+  #     - record: job_route:loki_request_duration_seconds_bucket:sum_rate
+  #       expr: sum(rate(loki_request_duration_seconds_bucket[1m])) by (le, job, route)
+  #     - record: node_namespace_pod_container:container_cpu_usage_seconds_total:sum_rate
+  #       expr: sum(rate(container_cpu_usage_seconds_total[1m])) by (node, namespace, pod, container)
+
+
+# Configuration for the gateway
+gateway:
+  enabled: false
+  replicas: 1
+  # -- Enable logging of 2xx and 3xx HTTP requests
+  verboseLogging: true
+  image:
+    registry: null
+    pullSecrets: []
+    repository: nginxinc/nginx-unprivileged
+    tag: 1.27-alpine
+    pullPolicy: IfNotPresent
+  terminationGracePeriodSeconds: 30
+  maxUnavailable: 1
+  minReadySeconds: 10
+  service:
+    port: 80
+    type: ClusterIP
+    # -- ClusterIP of the gateway service
+    clusterIP: null
+    # -- Node port if service type is NodePort
+    nodePort: null
+    # -- Load balancer IP address if service type is LoadBalancer
+    loadBalancerIP: null
+    annotations: {}
+    labels: {}
+    additionalPorts: []
+  # Basic auth configuration
+  basicAuth:
+    # -- Enables basic authentication for the gateway
+    enabled: false
+    # -- The basic auth username for the gateway
+    username: null
+    # -- The basic auth password for the gateway
+    password: null
+    # -- Uses the specified username and password to compute a htpasswd using Sprig's `htpasswd` function.
+    # The value is templated using `tpl`. Override this to use a custom htpasswd, e.g. in case the default causes
+    # high CPU load.
+    htpasswd: >-
+      {{ htpasswd (required "'gateway.basicAuth.username' is required" .Values.gateway.basicAuth.username) (required "'gateway.basicAuth.password' is required" .Values.gateway.basicAuth.password) }}
+    # -- Existing basic auth secret to use. Must contain '.htpasswd'
+    existingSecret: null
+  # Configures the readiness probe for the gateway
+  readinessProbe:
+    httpGet:
+      path: /
+      port: http-metrics
+    initialDelaySeconds: 15
+    timeoutSeconds: 1
+  nginxConfig:
+    # -- NGINX log format
+    logFormat: |-
+      main '$remote_addr - $remote_user [$time_local]  $status '
+              '"$request" $body_bytes_sent "$http_referer" '
+              '"$http_user_agent" "$http_x_forwarded_for"';
+    # -- Allows appending custom configuration to the server block
+    serverSnippet: ''
+    # -- Allows appending custom configuration to the http block
+    httpSnippet: ''
+    # -- Allows overriding the DNS resolver address nginx will use
+    resolver: ''
+    # -- Config file contents for Nginx. Passed through the `tpl` function to allow templating
+    # @default -- See values.yaml
+    file: |
+      worker_processes  5;  ## Default: 1
+      error_log  /dev/stderr;
+      pid        /tmp/nginx.pid;
+      worker_rlimit_nofile 8192;
+
+      events {
+        worker_connections  4096;  ## Default: 1024
+      }
+
+      http {
+        client_body_temp_path /tmp/client_temp;
+        proxy_temp_path       /tmp/proxy_temp_path;
+        fastcgi_temp_path     /tmp/fastcgi_temp;
+        uwsgi_temp_path       /tmp/uwsgi_temp;
+        scgi_temp_path        /tmp/scgi_temp;
+
+        proxy_http_version    1.1;
+
+        default_type application/octet-stream;
+        log_format   {{ .Values.gateway.nginxConfig.logFormat }}
+
+        {{- if .Values.gateway.verboseLogging }}
+        access_log   /dev/stderr  main;
+        {{- else }}
+
+        map $status $loggable {
+          ~^[23]  0;
+          default 1;
+        }
+        access_log   /dev/stderr  main  if=$loggable;
+        {{- end }}
+
+        sendfile     on;
+        tcp_nopush   on;
+        {{- if .Values.gateway.nginxConfig.resolver }}
+        resolver {{ .Values.gateway.nginxConfig.resolver }};
+        {{- else }}
+        resolver {{ .Values.global.dnsService }}.{{ .Values.global.dnsNamespace }}.svc.{{ .Values.global.clusterDomain }};
+        {{- end }}
+
+        {{- with .Values.gateway.nginxConfig.httpSnippet }}
+        {{ . | nindent 2 }}
+        {{- end }}
+
+        server {
+          listen             8080;
+
+          {{- if .Values.gateway.basicAuth.enabled }}
+          auth_basic           "Tempo";
+          auth_basic_user_file /etc/nginx/secrets/.htpasswd;
+          {{- end }}
+
+          location = / {
+            return 200 'OK';
+            auth_basic off;
+          }
+
+          location = /jaeger/api/traces {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:14268/api/traces;
+          }
+
+          location = /zipkin/spans {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:9411/spans;
+          }
+
+          location = /v1/traces {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:4318/v1/traces;
+          }
+
+          location = /otlp/v1/traces {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:4318/v1/traces;
+          }
+
+          location ^~ /api {
+            set $query_frontend {{ include "tempo.resourceName" (dict "ctx" . "component" "query-frontend") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$query_frontend:3200$request_uri;
+          }
+
+          location = /flush {
+            set $ingester {{ include "tempo.resourceName" (dict "ctx" . "component" "ingester") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$ingester:3200$request_uri;
+          }
+
+          location = /shutdown {
+            set $ingester {{ include "tempo.resourceName" (dict "ctx" . "component" "ingester") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$ingester:3200$request_uri;
+          }
+
+          location = /distributor/ring {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:3200$request_uri;
+          }
+
+          location = /ingester/ring {
+            set $distributor {{ include "tempo.resourceName" (dict "ctx" . "component" "distributor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$distributor:3200$request_uri;
+          }
+
+          location = /compactor/ring {
+            set $compactor {{ include "tempo.resourceName" (dict "ctx" . "component" "compactor") }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }};
+            proxy_pass       http://$compactor:3200$request_uri;
+          }
+
+          {{- with .Values.gateway.nginxConfig.serverSnippet }}
+          {{ . | nindent 4 }}
+          {{- end }}
+        }
+      }
+
+
+# helm upgrade --install tempo grafana/tempo-distributed -n tempo --create-namespace -f tempo/tempo-override-values.yaml
+
+
+#TraceQL
+
+# { resource.service.name="otel-python-app" } with (most_recent=true)
