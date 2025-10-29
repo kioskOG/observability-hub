@@ -23,6 +23,27 @@
 # observability-hub
 
 
+> [!IMPORTANT]
+> # If you wanna use Makefile for the complete deployment.
+
+## ✅ How to Run
+
+```bash
+make help
+make init                     # Setup all prerequisits including AWS roles, buckets & policies
+make install                  # Complete Setup deploy
+make install-loki             # Just Loki
+make install-tempo            # Just Tempo
+make uninstall-alloy          # Uninstall Alloy
+make status-mimir             # Get Mimir status
+make logs-tempo               # Tail Tempo logs
+make template-debug-loki      # Render Loki manifests
+make pf-grafana               # port forward to grafana service
+```
+
+> [!NOTE]
+> For manual setup follow below steps.
+
 ## Deploy the Loki Helm chart on AWS
 I expect you to have the necessary tools and permissions to deploy resources on AWS, such as:
 
@@ -502,25 +523,3 @@ kubectl logs -n alloy-logs -l app.kubernetes.io/name=grafana-alloy --tail=100
 helm upgrade --install mimir grafana/mimir-distributed -n mimir -f ./mimir/mimir-override-values.yaml
 helm upgrade --install tempo grafana/tempo-distributed -n tempo --create-namespace -f ./tempo/tempo-override-values.yaml
 ```
-
-
-
-
-> [!IMPORTANT]
-> # If you wanna use Makefile for the deployments. Create the AWS resources first.
-
-
-## ✅ How to Run
-
-```bash
-make help
-make install                  # Install all
-make install-loki             # Just Loki
-make install-tempo            # Just Tempo
-make uninstall-alloy          # Uninstall Alloy
-make status-mimir             # Get Mimir status
-make logs-tempo               # Tail Tempo logs
-make template-debug-loki      # Render Loki manifests
-make pf-grafana               # port forward to grafana service
-```
-
