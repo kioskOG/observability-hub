@@ -1542,17 +1542,35 @@ grafana:
           basicAuthPassword: mimir-nginx
         isDefault: false
         editable: true
-      - name: Loki # (name of the data source)
-        type: loki # (type of data source)
+      # Alloy sends pod logs with Loki tenant = pod namespace (alloy-configMap: stage.tenant { label = "namespace" }).
+      # X-Scope-OrgID here must match that namespace. Duplicate with another uid for other namespaces (alloy-logs, kube-system, …).
+      - name: Loki
+        type: loki
         uid: loki
-        access: proxy # (access type)
+        access: proxy
         orgId: 1
-        url: http://loki-gateway.loki.svc.cluster.local # (URL of the Loki data source. Loki uses an nginx gateway to direct traffic to the appropriate component)
+        url: http://loki-gateway.loki.svc.cluster.local
         basicAuth: true
         basicAuthUser: loki-canary
         secureJsonData:
           basicAuthPassword: loki-canary
-          httpHeaderValue1: "tenant1"
+          httpHeaderValue1: "default"
+        isDefault: false
+        version: 1
+        editable: true
+        jsonData:
+          httpHeaderName1: "X-Scope-OrgID"
+      - name: Loki (monitoring)
+        type: loki
+        uid: loki-monitoring
+        access: proxy
+        orgId: 1
+        url: http://loki-gateway.loki.svc.cluster.local
+        basicAuth: true
+        basicAuthUser: loki-canary
+        secureJsonData:
+          basicAuthPassword: loki-canary
+          httpHeaderValue1: "monitoring"
         isDefault: false
         version: 1
         editable: true

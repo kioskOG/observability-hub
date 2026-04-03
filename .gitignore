@@ -1,0 +1,2 @@
+# Local AWS POC state (bucket names, region) — do not commit
+.observability-poc-aws.state

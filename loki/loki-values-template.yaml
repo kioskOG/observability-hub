@@ -1,4 +1,13 @@
+# Pin AWS SDK default region for IRSA/S3 — must match where buckets live, not necessarily the EKS cluster region. script.sh sets s3_bucket_region (defaults to cluster region_name).
+global:
+  extraEnv:
+    - name: AWS_REGION
+      value: "${s3_bucket_region}"
+    - name: AWS_DEFAULT_REGION
+      value: "${s3_bucket_region}"
+
 loki:
+  auth_enabled: true
   # --  Optional Loki UI: Provides access to a operators UI for Loki distributed. When enabled UI will be available at /ui/ of loki-gateway
   ui:
     # Disabled by default for backwards compatibility. Enable to use the Loki UI.
@@ -34,7 +43,7 @@ loki:
           period: 24h
   storage_config:
     aws:
-      region: "${region_name}" # for example, eu-west-2  
+      region: "${s3_bucket_region}" # bucket region (can differ from EKS cluster)
       bucketnames: "${env_loki_chunk_bucket}" # Your actual S3 bucket name, for example, loki-aws-dev-chunks
       s3forcepathstyle: false
   ingester:
@@ -102,7 +111,7 @@ loki:
     storage:
       type: s3
       s3:
-        region: "${region_name}" # for example, eu-west-2
+        region: "${s3_bucket_region}" # bucket region (can differ from EKS cluster)
         bucketnames: "${env_loki_ruler_bucket}" # Your actual S3 bucket name, for example, loki-aws-dev-ruler
         s3forcepathstyle: false
       alertmanager_url: http://prom:9093 # The URL of the Alertmanager to send alerts (Prometheus, Mimir, etc.)
@@ -113,11 +122,11 @@ loki:
   storage:
       type: s3
       bucketNames:
-        chunks: "${region_name}" # Your actual S3 bucket name (loki-aws-dev-chunks)
+        chunks: "${env_loki_chunk_bucket}" # must match storage_config.aws.bucketnames
         ruler: "${env_loki_ruler_bucket}" # Your actual S3 bucket name (loki-aws-dev-ruler)
         # admin: "<Insert s3 bucket name>" # Your actual S3 bucket name (loki-aws-dev-admin) - GEL customers only
       s3:
-        region: "${region_name}" # eu-west-2
+        region: "${s3_bucket_region}" # bucket region (can differ from EKS cluster)
         #insecure: false
       # s3forcepathstyle: false  
 
@@ -135,9 +144,10 @@ loki:
       default_validity: 12h
 
 serviceAccount:
- create: true
- annotations:
-   "eks.amazonaws.com/role-arn": "${loki_role_arn}" # The service role you created
+  create: true
+  name: loki
+  annotations:
+    eks.amazonaws.com/role-arn: "${loki_role_arn}"
 
 deploymentMode: Distributed
 
@@ -312,9 +322,13 @@ gateway:
               '"$http_user_agent" "$http_x_forwarded_for"';
     # -- Allows appending custom configuration to the server block
     serverSnippet: ""
-    # -- Allows appending custom configuration to the http block, passed through the `tpl` function to allow templating
-    httpSnippet: >-
-      {{ if .Values.loki.tenants }}proxy_set_header X-Scope-OrgID $remote_user;{{ end }}
+    # Loki chart runs this through tpl(); plain text $vars are fine. script.sh uses restricted envsubst so nginx $vars are not stripped.
+    httpSnippet: |
+      map $http_x_scope_orgid $loki_org_id {
+        ""      "loki-system";
+        default $http_x_scope_orgid;
+      }
+      proxy_set_header X-Scope-OrgID $loki_org_id;
     # -- Allows customizing the `client_max_body_size` directive
     clientMaxBodySize: 4M
     # -- Whether ssl should be appended to the listen directive of the server block or not.
@@ -346,6 +360,7 @@ lokiCanary:
   extraArgs:
     - -pass=$(LOKI_PASS)
     - -user=$(LOKI_USER)
+    - -tenant-id=loki-system
   extraEnv:
     - name: LOKI_PASS
       valueFrom:

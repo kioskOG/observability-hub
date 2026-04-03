@@ -97,8 +97,8 @@ ingester:
           store: memberlist
           replication_factor: 2
         tokens_file_path: /var/tempo/tokens.json
-    # -- Number of copies of spans to store in the ingester ring
-    replication_factor: 3
+    # -- Number of copies of spans to store in the ingester ring (must be <= ingester.replicas when zoneAwareReplication is off)
+    replication_factor: 2
     # -- Amount of time a trace must be idle before flushing it to the wal.
     trace_idle_period: 10s
     # -- How often to sweep all tenants and move traces from live -> wal -> completed blocks.
@@ -125,8 +125,8 @@ storage:
     backend: s3
     s3:
       bucket: ${env_tempo_chunk_bucket}
-      endpoint: s3.${region_name}.amazonaws.com
-      region: ${region_name}
+      endpoint: s3.${s3_bucket_region}.amazonaws.com
+      region: ${s3_bucket_region}
       insecure: false
     pool:
       max_workers: 400

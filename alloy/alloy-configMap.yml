@@ -5,6 +5,9 @@ metadata:
   namespace: alloy-logs
 data:
   config.alloy: |
+    // Multi-tenant Loki: tenant = Kubernetes namespace for pod logs & events; fixed tenants for platform/syslog/journal, alloy-logs, and OTLP span logs ("traces").
+    // Requires loki.auth_enabled=true and credentials in Secret alloy-remote-credentials (see alloy-override-values.yaml).
+
     discovery.kubernetes "pods" {
       role = "pod"
      
@@ -89,10 +92,15 @@ data:
       forward_to = [prometheus.remote_write.mimir.receiver]
     }
 
+    loki.process "alloy_internal_logs" {
+      stage.tenant { value = "alloy-logs" }
+      forward_to = [loki.write.loki.receiver]
+    }
+
     logging {
       level    = "info"
       format   = "json"
-      write_to = [loki.write.loki.receiver]
+      write_to = [loki.process.alloy_internal_logs.receiver]
     }
 
     // tracing {
@@ -118,11 +126,15 @@ data:
       }]
     }
 
+    loki.process "node_syslog_tenant" {
+      stage.tenant { value = "platform" }
+      forward_to = [loki.write.loki.receiver]
+    }
+
     // loki.source.file reads log entries from files and forwards them to other loki.* components.
-    // You can specify multiple loki.source.file components by giving them different labels.
     loki.source.file "node_logs" {
       targets    = local.file_match.node_logs.targets
-      forward_to = [loki.write.loki.receiver]
+      forward_to = [loki.process.node_syslog_tenant.receiver]
     }
 
     // Node journald logs from Amazon Linux 2 (EKS)
@@ -244,6 +256,8 @@ data:
         ]
       }
 
+      stage.tenant { value = "platform" }
+
       forward_to = [loki.write.loki.receiver]
     }
 
@@ -333,35 +347,32 @@ data:
       }
 
       stage.regex {
-        // This regex looks for 'trace_id' and 'span_id' keys followed by various characters,
-        // then captures the hexadecimal ID. It's more tolerant of surrounding text.
-        // It uses a non-greedy match (.*?) to capture the content between the key and the ID.
-        
         expression = "(?:trace_id|TraceID|traceID)[^a-zA-Z0-9]*(?P<trace_id>[0-9a-fA-F]{32})|(?:span_id|SpanID|spanID)[^a-zA-Z0-9]*(?P<span_id>[0-9a-fA-F]{16})"
-        
-        // Explanation of the regex:
-        // (?:trace_id|TraceID|traceID)   - Matches 'trace_id', 'TraceID', or 'traceID' (non-capturing group)
-        // [^a-zA-Z0-9]* - Matches any non-alphanumeric character zero or more times (to handle ':', '=', spaces, quotes, etc.)
-        // (?P<trace_id>[0-9a-fA-F]{32})   - Captures 32 hexadecimal characters into 'trace_id' named group
-        // |                               - OR
-        // (?:span_id|SpanID|spanID)     - Matches 'span_id', 'SpanID', or 'spanID'
-        // [^a-zA-Z0-9]* - Same as above
-        // (?P<span_id>[0-9a-fA-F]{16})    - Captures 16 hexadecimal characters into 'span_id' named group
-        // Note: This regex assumes the standard lengths for Trace ID (32 hex chars) and Span ID (16 hex chars).
-        // If your IDs can be different lengths, adjust {32} and {16} accordingly or use a broader match like +
       }
 
-      stage.labels {
+      stage.structured_metadata {
         values = {
-          trace_id = "",    // Promote captured group to a label
-          span_id  = "",    // Promote captured group to a label
+          trace_id = "trace_id",
+          span_id  = "span_id",
         }
+      }
+
+      stage.tenant {
+        label = "namespace"
       }
 
       forward_to = [loki.write.loki.receiver]
     }
 
     loki.process "cluster_events" {
+      stage.static_labels {
+        values = {
+          cluster     = sys.env("KUBE_CLUSTER_NAME"),
+          environment = sys.env("ENVIRONMENT_NAME"),
+          region      = sys.env("AWS_REGION"),
+        }
+      }
+
       stage.replace {
         expression = "(\"type\":\"Normal\")"
         replace = "\"type\":\"Normal\",\"level\":\"info\""
@@ -379,12 +390,19 @@ data:
           k8s_event_reason  = "reason",
           k8s_event_message = "message",
           k8s_event_type    = "type",
+          k8s_namespace_name = "namespace",
         }
+      }
+
+      stage.replace {
+        source     = "k8s_namespace_name"
+        expression = "^$"
+        replace    = "cluster"
       }
 
       stage.labels {
         values = {
-          k8s_namespace_name = "namespace",
+          k8s_namespace_name = "k8s_namespace_name",
           k8s_resource_kind  = "k8s_resource_kind",
           k8s_event_reason   = "k8s_event_reason",
           k8s_event_type     = "k8s_event_type",
@@ -400,7 +418,11 @@ data:
       }
 
       stage.label_keep {
-        values = ["cluster", "organization", "region", "job", "k8s_namespace_name", "k8s_resource_kind", "k8s_event_reason", "k8s_event_type"]
+        values = ["cluster", "environment", "region", "job", "k8s_namespace_name", "k8s_resource_kind", "k8s_event_reason", "k8s_event_type"]
+      }
+
+      stage.tenant {
+        label = "k8s_namespace_name"
       }
 
       forward_to = [loki.write.loki.receiver]
@@ -410,9 +432,9 @@ data:
     loki.write "loki" {
       endpoint {
         url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
-        headers = {
-          "Authorization" = "Basic bG9raS1jYW5hcnk6bG9raS1jYW5hcnk=",
-          "X-Scope-OrgID" = "tenant1",
+        basic_auth {
+          username = sys.env("LOKI_GATEWAY_USERNAME")
+          password = sys.env("LOKI_GATEWAY_PASSWORD")
         }
       }
       external_labels = {
@@ -529,8 +551,9 @@ data:
     prometheus.remote_write "mimir" {
       endpoint {
         url = "http://mimir-nginx.mimir.svc.cluster.local/api/v1/push"
-        headers = {
-          "Authorization" = "Basic bWltaXItbmdpbng6bWltaXItbmdpbng=",
+        basic_auth {
+          username = sys.env("MIMIR_REMOTE_WRITE_USERNAME")
+          password = sys.env("MIMIR_REMOTE_WRITE_PASSWORD")
         }
       }
       external_labels = {
@@ -549,8 +572,30 @@ data:
       labels = ["trace_id", "span_id", "service.name"]
 
       output {
+        logs = [otelcol.processor.attributes.spanlogs_loki_metadata.input]
+      }
+    }
+
+    otelcol.processor.attributes "spanlogs_loki_metadata" {
+      action {
+        key    = "loki.resource.labels"
+        action = "insert"
+        value  = "k8s.namespace.name"
+      }
+      output {
         logs = [otelcol.exporter.loki.spanlogs_exporter.input]
       }
+    }
+
+    otelcol.exporter.loki "spanlogs_exporter" {
+      forward_to = [loki.process.spanlogs_tenant.receiver]
+    }
+
+    loki.process "spanlogs_tenant" {
+      stage.tenant {
+        value = "traces"
+      }
+      forward_to = [loki.write.loki.receiver]
     }
 
     otelcol.exporter.otlp "tempo" {
@@ -561,10 +606,6 @@ data:
           insecure_skip_verify = true
         }
       }
-    }
-
-    otelcol.exporter.loki "spanlogs_exporter" {
-      forward_to = [loki.write.loki.receiver]
     }
 
     livedebugging {
@@ -673,14 +714,6 @@ data:
         source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
         target_label  = "app"
         action        = "replace"
-      }
-
-      rule {
-        source_labels = ["__meta_kubernetes_pod_annotation_pyroscope_io_service_name"]
-        regex         = ""
-        replacement   = "$1"
-        target_label  = "service_name"
-        action        = "drop"
       }
 
       rule {
@@ -876,7 +909,7 @@ data:
 
     pyroscope.scrape "pyroscope_scrape_goroutine" {
       clustering {
-        enabled = true
+        enabled = false
       }
 
       targets    = concat(discovery.relabel.kubernetes_pods_goroutine_default_name.output, discovery.relabel.kubernetes_pods_goroutine_custom_name.output)
@@ -997,7 +1030,7 @@ data:
 
     pyroscope.scrape "pyroscope_scrape_block" {
       clustering {
-        enabled = true
+        enabled = false
       }
 
       targets    = concat(discovery.relabel.kubernetes_pods_block_default_name.output, discovery.relabel.kubernetes_pods_block_custom_name.output)
@@ -1118,7 +1151,7 @@ data:
 
     pyroscope.scrape "pyroscope_scrape_mutex" {
       clustering {
-        enabled = true
+        enabled = false
       }
 
       targets    = concat(discovery.relabel.kubernetes_pods_mutex_default_name.output, discovery.relabel.kubernetes_pods_mutex_custom_name.output)
@@ -1239,7 +1272,7 @@ data:
 
     pyroscope.scrape "pyroscope_scrape_fgprof" {
       clustering {
-        enabled = true
+        enabled = false
       }
 
       targets    = concat(discovery.relabel.kubernetes_pods_fgprof_default_name.output, discovery.relabel.kubernetes_pods_fgprof_custom_name.output)

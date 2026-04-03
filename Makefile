@@ -80,7 +80,43 @@ init:
 	@kubectl create secret generic loki-basic-auth --from-file=loki/.htpasswd -n loki --dry-run=client -o yaml | kubectl apply -f -
 	@kubectl create secret generic canary-basic-auth --from-literal=username=loki-canary --from-literal=password=loki-canary -n loki --dry-run=client -o yaml | kubectl apply -f -
 
+	@$(MAKE) apply-alloy-manifests
+
 	@echo "✅ All initial setup complete."
+
+
+# -------------------------------------
+# Alloy Kubernetes manifests (Secret + ConfigMap). Re-run after editing alloy-configMap.yml
+# or alloy-remote-credentials-secret.yaml. Align Secret credentials with loki/.htpasswd (gateway user/password).
+
+apply-alloy-manifests:
+	@echo "📦 Applying Alloy Secret + ConfigMap ($(NAMESPACE_alloy))..."
+	@kubectl apply -f ./alloy/alloy-remote-credentials-secret.yaml
+	@kubectl apply -f ./alloy/alloy-configMap.yml
+
+
+# -------------------------------------
+# AWS POC cleanup (S3 + IAM created by script.sh — not Kubernetes)
+
+aws-cleanup-dry-run:
+	@chmod +x ./cleanup-aws.sh
+	@if [ -f ./.observability-poc-aws.state ]; then \
+		echo "👉 Using .observability-poc-aws.state (dry-run)"; \
+		./cleanup-aws.sh --dry-run --from-state; \
+	else \
+		echo "👉 No state file — you will be prompted like script.sh (dry-run)"; \
+		./cleanup-aws.sh --dry-run; \
+	fi
+
+aws-cleanup:
+	@chmod +x ./cleanup-aws.sh
+	@if [ -f ./.observability-poc-aws.state ]; then \
+		echo "👉 Using .observability-poc-aws.state"; \
+		./cleanup-aws.sh --from-state; \
+	else \
+		echo "👉 No state file — you will be prompted like script.sh"; \
+		./cleanup-aws.sh; \
+	fi
 
 
 # -------------------------------------
@@ -100,14 +136,7 @@ install-tempo:
 		--values $(VALUES_tempo) \
 		--debug
 
-install-alloy:
-	@if ! kubectl get configmap alloy-config -n $(NAMESPACE_alloy) > /dev/null 2>&1; then \
-		echo "📦 Applying alloy ConfigMap..."; \
-		kubectl apply -f ./alloy/alloy-configMap.yml; \
-	else \
-		echo "✅ ConfigMap 'alloy-config' already exists. Skipping apply."; \
-	fi
-
+install-alloy: apply-alloy-manifests
 	helm upgrade --install grafana-alloy $(CHART_alloy) \
 		--version $(VERSION_alloy) \
 		-n $(NAMESPACE_alloy) \
@@ -196,6 +225,7 @@ uninstall-cleanup:
 	-kubectl delete secret canary-basic-auth -n $(NAMESPACE_loki) || true
 	-kubectl delete secret mimir-basic-auth -n $(NAMESPACE_mimir) || true
 	-kubectl delete secret mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) || true
+	-kubectl delete secret alloy-remote-credentials -n $(NAMESPACE_alloy) || true
 
 	@echo "🗑 Deleting ConfigMaps..."
 	-kubectl delete configmap alloy-config -n $(NAMESPACE_alloy) || true
@@ -243,7 +273,7 @@ template-debug-%:
 # -------------------------------------
 # Batch commands
 
-install: init install-mimir install-kube-prometheus-stack install-loki install-tempo install-alloy install-pyroscope install-blackbox
+install: init install-loki install-kube-prometheus-stack install-mimir install-tempo install-alloy install-pyroscope install-blackbox
 status: status-loki status-tempo status-alloy status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox
 logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox
 template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox
@@ -257,8 +287,13 @@ help:
 	@echo "🚀 LGTM Stack Deployment Makefile"
 	@echo ""
 	@echo "Available targets:"
-	@echo "  make init                  - Add Helm repos and create namespaces"
+	@echo "  make init                  - Run script.sh (optional AWS S3/IAM — prompts unless OBSERVABILITY_PROVISION_AWS is set), then repos, secrets, Alloy manifests"
+	@echo "  make apply-alloy-manifests - kubectl apply Alloy credentials Secret + alloy-config ConfigMap"
+	@echo "  make aws-cleanup-dry-run   - List S3/IAM resources script.sh would remove (no deletes)"
+	@echo "  make aws-cleanup           - Delete those AWS resources (type DELETE to confirm)"
 	@echo "  make install               - Install all components (loki, tempo, alloy, mimir, kube-prometheus-stack)"
+	@echo "  make install-loki          - Helm upgrade Loki (applies auth_enabled / gateway httpSnippet from values)"
+	@echo "  make install-alloy         - apply-alloy-manifests + Helm upgrade Alloy (picks up env + config reload)"
 	@echo "  make uninstall             - Uninstall loki, tempo, mimir, kube-prometheus-stack"
 	@echo "  make uninstall-alloy       - Uninstall Alloy separately"
 	@echo "  make uninstall-cleanup     - Delete Secrets, ConfigMap, Namespaces"
@@ -269,8 +304,17 @@ help:
 	@echo "  make template-debug        - Render Helm templates for all components"
 	@echo "  make template-debug-<comp> - Debug Helm templates for a component"
 	@echo ""
+	@echo "Loki multi-tenant + Grafana:"
+	@echo "  - After changing Loki values: make install-loki"
+	@echo "  - In each Grafana Loki datasource, add HTTP header X-Scope-OrgID (e.g. monitoring, default)"
+	@echo "    or create one datasource per tenant."
+	@echo "  - Keep alloy/alloy-remote-credentials-secret.yaml stringData in sync with loki/.htpasswd"
+	@echo "    (same user/password Alloy uses for loki-gateway basic auth)."
+	@echo ""
 	@echo "Examples:"
 	@echo "  make install-loki"
+	@echo "  make apply-alloy-manifests"
+	@echo "  make aws-cleanup-dry-run && make aws-cleanup   # after POC"
 	@echo "  make logs-tempo"
 	@echo "  make template-debug-mimir"
 	@echo ""

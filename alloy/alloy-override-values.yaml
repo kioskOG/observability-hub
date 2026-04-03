@@ -87,6 +87,26 @@ alloy:
       valueFrom:
         fieldRef:
           fieldPath: spec.nodeName
+    - name: LOKI_GATEWAY_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: loki_gateway_username
+    - name: LOKI_GATEWAY_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: loki_gateway_password
+    - name: MIMIR_REMOTE_WRITE_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: mimir_remote_write_username
+    - name: MIMIR_REMOTE_WRITE_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: mimir_remote_write_password
 
   mounts:
     # -- Mount /var/log from the host into the container for log collection.
