@@ -791,7 +791,7 @@ data:
       forward_to      = [pyroscope.write.pyroscope.receiver]
       delta_profiling_duration = "55s"
       scrape_interval = "60s"
-      scrape_timeout  = "10s"
+      scrape_timeout  = "45s"
 
       profiling_config {
         profile.fgprof {
@@ -807,7 +807,9 @@ data:
         }
 
         profile.memory {
-          enabled = false
+          enabled = true
+          delta   = false
+          path    = "/debug/pprof/allocs"
         }
 
         profile.process_cpu {

@@ -71,7 +71,7 @@ flowchart LR
 
 | Path | Purpose |
 |------|---------|
-| `Makefile` | Install order, `init`, per-component Helm installs, port-forwards, cleanup |
+| `Makefile` | Install order, `init`, per-component Helm installs, port-forwards, cleanup; passes **Prometheus `clusterName`** from `.observability-poc-aws.state` when present |
 | `loki/` | Loki Helm overrides, IAM policy/trust examples, `.htpasswd` (not committed if you create locally) |
 | `mimir/` | Mimir overrides, rules, dashboards, Prometheus remote_write secret template |
 | `tempo/` | Tempo overrides, trace demo app, optional templates |
@@ -150,6 +150,8 @@ If a policy is still attached to another role in your account, policy deletion m
 
    Install order in `make install`: **Mimir** → **kube-prometheus-stack** → **Loki** → **Tempo** → **Alloy** → **Pyroscope** → **Blackbox**.
 
+   **Prometheus external label `cluster`:** After `make init`, `make install-kube-prometheus-stack` (and `make install`) passes **`--set clusterName=…`** from **`cluster_name`** in **`.observability-poc-aws.state`** (written by `script.sh`). Override with **`CLUSTER_NAME=my-eks make install-kube-prometheus-stack`**. Match **`KUBE_CLUSTER_NAME`** in `alloy/alloy-override-values.yaml` so metrics from Prometheus and Alloy share the same `cluster` label in Mimir.
+
 4. **Grafana**: kube-prometheus-stack provisions **Mimir**, **Loki** (see below), **Tempo**, **Pyroscope**. Port-forward or use ingress:
 
    ```bash
@@ -174,6 +176,8 @@ If a policy is still attached to another role in your account, policy deletion m
 | `make uninstall` / `make uninstall-all` / `make uninstall-cleanup` | Teardown (cleanup deletes PVCs and namespaces; use with care) |
 
 `make install-alloy` always reapplies the Alloy Secret and ConfigMap before Helm upgrade so env vars and River config stay in sync.
+
+**kube-prometheus-stack:** `install-kube-prometheus-stack` adds **`--set clusterName=…`** when **`CLUSTER_NAME`** is set in the environment or read from **`.observability-poc-aws.state`** (`cluster_name=`). If neither is set, Helm uses `prometheus-values.yaml` only (see [Quick start](#quick-start)).
 
 ---
 
@@ -235,6 +239,14 @@ After rotating `loki/.htpasswd`, update **`alloy/alloy-remote-credentials-secret
 - **River config**: `alloy/alloy-configMap.yml` → ConfigMap `alloy-config`, key `config.alloy`.
 - Collects **pod logs**, **Kubernetes events**, optional **node** logs, ships **OTLP** traces/metrics to Tempo/Mimir, **profiles** to Pyroscope, and **span logs** to Loki.
 
+### Continuous profiling (Pyroscope)
+
+- **Push:** Apps using a **Pyroscope SDK** can POST to Alloy **`pyroscope.receive_http`** on port **4041** (forwarded to `pyroscope.write` → Pyroscope distributor). The sample Python app in `pyroscope/pyroscope-app/` uses this path; the official **Python** client focuses on **CPU**-style sampling (`oncpu`, GIL), not Go-style heap pprof.
+- **Pull (pprof):** Pods annotated for scrape (see `discovery.relabel.profiling_targets` in `alloy/alloy-configMap.yml`) are scraped by **`pyroscope.scrape.kubernetes_cpu_memory_profiles`**, which collects **CPU** (`/debug/pprof/profile`) and **memory allocations** (`/debug/pprof/allocs` via `profile.memory`). Use annotations such as `pyroscope.io/scrape`, `pyroscope.io/port`, `pyroscope.io/profile_path`, and **`pyroscope.io/profile_path_allocs`** when the allocs path is not the default. For **in-use heap** (`/debug/pprof/heap`), add a **second** `pyroscope.scrape` with `profile.memory` and `path = "/debug/pprof/heap"` (Alloy allows one path per memory block).
+- **eBPF:** `pyroscope.ebpf` in the same ConfigMap profiles workloads from the node; behavior differs from application heap pprof.
+
+Re-run **`make apply-alloy-manifests`** and roll Alloy after editing the ConfigMap.
+
 ---
 
 ## AWS IAM and S3
@@ -268,12 +280,14 @@ You can load-test Loki with **xk6-loki** as in the original guide: point the cli
 
 ## Values templates
 
-`./script.sh` renders these with **restricted** `envsubst` (only specific `${VAR}` placeholders) so nginx `$variables` inside gateway configs are not stripped. If you run `envsubst` yourself, use the same allowlist as in `script.sh`.
+`./script.sh` renders these with **restricted** `envsubst` (only specific `${VAR}` placeholders) so nginx `$variables` inside gateway configs are not stripped. If you run `envsubst` yourself, use the same allowlist as in `script.sh` (`OBSERVABILITY_ENVSUBST_FORMAT` in `script.sh`).
 
 - `loki/loki-values-template.yaml`
-- `mimir/mimir-values-template.yaml`
-- `tempo/tempo-values-template.yaml`
-- `pyroscope/pyroscope-values-template.yaml`
+- `mimir/mimir-values-template.yaml` — production-style HA defaults (replicas, PDBs, S3 `region`, distributor timeouts, etc.). **Install Mimir with Helm release name `mimir` in namespace `mimir`** (as in `make install-mimir`). The chart validates that **chart-managed Memcached** addresses in `mimir.structuredConfig` match that layout; do not replace internal `*.mimir.svc.cluster.local` names with envsubst placeholders.
+- `tempo/tempo-values-template.yaml` — higher replicas, RF **3** ingesters, longer **block retention** (7d default in template), larger PVCs; includes **`queryFrontend.replicas`** for the main query path.
+- `pyroscope/pyroscope-values-template.yaml` — HA-oriented replica counts, **RF 3** ingester/store-gateway ring, **`log.level: info`**, tuned resources/timeouts.
+
+After changing templates, run **`make init`** (or the `envsubst` step) to regenerate `*-override-values.yaml` before `helm upgrade`.
 
 ---
 
@@ -288,6 +302,8 @@ You can load-test Loki with **xk6-loki** as in the original guide: point the cli
 - **Alloy pods crash or 401 to Loki**: Check `alloy-remote-credentials` matches **`loki/.htpasswd`** and that `make apply-alloy-manifests` was applied.
 - **Grafana Loki “no data”**: The provisioned datasource’s **X-Scope-OrgID** must match the **tenant Alloy wrote to** (usually the pod **namespace**). See **[Multi-tenant Loki](#multi-tenant-loki)**. Confirm with **`kubectl logs -n alloy-logs -l app.kubernetes.io/name=alloy`** (look for 401s to `loki-gateway`).
 - **Helm upgrade errors**: Run `make template-debug-<component>` to validate rendered YAML; check chart CHANGELOG for breaking changes when bumping `VERSION_*` in the Makefile.
+- **Mimir install: “chunks cache address … different from … expected”**: The **mimir-distributed** chart checks Memcached hostnames in values against its own computed Services. Use **release `mimir`** and **namespace `mimir`**, and keep **`*-chunks-cache.mimir.svc.cluster.local`** (and related) strings in generated overrides — do not leave unreplaced `${…}` placeholders in `mimir.structuredConfig` when **chunks-cache** (and other built-in caches) are enabled.
+- **Empty Mimir S3 buckets**: TSDB blocks appear only after ingesters flush and compactors upload (often **up to a couple of hours**). The **ruler** bucket may stay sparse until ruler/Alertmanager state exists. Confirm ingest with distributor metrics/logs; then check IRSA/S3 permissions on compactor/ingester if blocks never appear.
 
 ---
 

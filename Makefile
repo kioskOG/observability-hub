@@ -45,6 +45,15 @@ VALUES_kps   = ./kube-prometheus-stack/prometheus-values.yaml
 VALUES_pyroscope = ./pyroscope/pyroscope-override-values.yaml
 VALUES_blackbox = ./blackbox-exporter/values.yaml
 
+# -------------------------------------
+# kube-prometheus-stack: Prometheus external label cluster (same as script.sh cluster_name)
+
+OBSERVABILITY_STATE_FILE ?= ./.observability-poc-aws.state
+# Written by ./script.sh → make init. Override: CLUSTER_NAME=my-eks make install-kube-prometheus-stack
+CLUSTER_NAME ?= $(shell test -f $(OBSERVABILITY_STATE_FILE) && grep -E '^cluster_name=' $(OBSERVABILITY_STATE_FILE) 2>/dev/null | cut -d= -f2- | head -1 | tr -d '\r')
+# Only pass --set when non-empty so values.yaml / Helm defaults still apply when no state file exists
+HELM_KPS_CLUSTER_SET = $(if $(strip $(CLUSTER_NAME)),--set clusterName="$(CLUSTER_NAME)",)
+
 
 # -------------------------------------
 # Helm repo & namespace bootstrap
@@ -148,12 +157,15 @@ install-mimir:
 		--version $(VERSION_mimir) \
 		-n $(NAMESPACE_mimir) \
 		--values $(VALUES_mimir) \
+		--timeout 15m \
 		--debug
 
 install-kube-prometheus-stack:
+	@$(if $(strip $(CLUSTER_NAME)),echo "👉 kube-prometheus-stack: clusterName=$(CLUSTER_NAME) (from $(OBSERVABILITY_STATE_FILE) or env CLUSTER_NAME)";,echo "👉 kube-prometheus-stack: CLUSTER_NAME unset — using prometheus-values.yaml only";)
 	helm upgrade --install kube-prometheus-stack $(CHART_kps) \
 		-n $(NAMESPACE_kube-prometheus-stack) \
 		--values $(VALUES_kps) \
+		$(HELM_KPS_CLUSTER_SET) \
 		--debug
 
 install-pyroscope:
@@ -266,6 +278,11 @@ logs-%:
 
 # -------------------------------------
 # Template Debug Targets
+# Explicit kube-prometheus-stack target: pattern rule cannot use CHART_kube-prometheus-stack (hyphen parses as minus).
+
+template-debug-kube-prometheus-stack:
+	helm template kube-prometheus-stack $(CHART_kps) -n $(NAMESPACE_kube-prometheus-stack) --values $(VALUES_kps) $(HELM_KPS_CLUSTER_SET) --debug
+
 template-debug-%:
 	helm template $* $(CHART_$*) -n $(NAMESPACE_$*) --values $(VALUES_$*) --debug
 
@@ -273,7 +290,7 @@ template-debug-%:
 # -------------------------------------
 # Batch commands
 
-install: init install-loki install-kube-prometheus-stack install-mimir install-tempo install-alloy install-pyroscope install-blackbox
+install: init install-mimir install-kube-prometheus-stack install-loki install-tempo install-alloy install-pyroscope install-blackbox
 status: status-loki status-tempo status-alloy status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox
 logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox
 template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox
@@ -303,6 +320,10 @@ help:
 	@echo "  make logs-<component>      - Tail logs of a component (e.g. logs-loki)"
 	@echo "  make template-debug        - Render Helm templates for all components"
 	@echo "  make template-debug-<comp> - Debug Helm templates for a component"
+	@echo ""
+	@echo "kube-prometheus-stack cluster label:"
+	@echo "  After make init, cluster_name from .observability-poc-aws.state is passed as Helm clusterName."
+	@echo "  Override: CLUSTER_NAME=my-eks make install-kube-prometheus-stack"
 	@echo ""
 	@echo "Loki multi-tenant + Grafana:"
 	@echo "  - After changing Loki values: make install-loki"

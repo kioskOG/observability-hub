@@ -22,6 +22,14 @@ kubeVersionOverride: ""
 ##
 fullnameOverride: ""
 
+## Logical cluster identifier added as Prometheus external label `cluster` on all time series
+## and on alerts (remote_write to Mimir, federation, etc.). Set per environment, e.g.
+## `helm upgrade ... --set clusterName=my-eks-prod`. Align with Alloy `KUBE_CLUSTER_NAME`
+## in `alloy/alloy-override-values.yaml` so metrics from Prometheus and Alloy share the same label.
+## If unset, defaults to `unknown-cluster` (see prometheus.prometheusSpec.externalLabels).
+##
+clusterName: ""
+
 ## Labels to apply to all resources
 ##
 commonLabels: {}
@@ -1229,7 +1237,7 @@ grafana:
     # -- Docker image repository
     repository: grafana/grafana
     # Overrides the Grafana image tag whose default is the chart appVersion
-    tag: "12.1.0" #"12.0.2"
+    tag: "12.4.2" #"12.1.0" #"12.0.2"
 
   ## ForceDeployDatasources Create datasource configmap even if grafana deployment has been disabled
   ##
@@ -2663,7 +2671,7 @@ kube-state-metrics:
 ## Deploy node exporter as a daemonset to all nodes
 ##
 nodeExporter:
-  enabled: false
+  enabled: true
   operatingSystems:
     linux:
       enabled: true
@@ -4193,7 +4201,9 @@ prometheus:
 
     ## External labels to add to any time series or alerts when communicating with external systems
     ##
-    externalLabels: {}
+    externalLabels: {
+      cluster: '{{ .Values.clusterName | default "unknown-cluster" }}'
+    }
 
     ## enable --web.enable-remote-write-receiver flag on prometheus-server
     # Enable remote write receiver for Tempo metrics (default: false)
