@@ -1,0 +1,16 @@
+stage: "prod"
+env_name: "audit"
+aws_account_id: "000000000004"
+aws_account_name: "audit"
+account_name: "audit"
+aws_region: "us-east-2"
+namespace: "audit"
+
+# TODO: Fill in VPC/subnet/SG IDs once the VPC is provisioned
+# vpc_id: "vpc-XXXXXXXXXXXXXXXXX"
+# public_subnets: []
+# private_subnets: []
+
+tags:
+  Org: "SystemEngg"
+  Pod: "DevOps"

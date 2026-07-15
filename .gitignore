@@ -1,2 +1,7 @@
 # Local AWS POC state (bucket names, region) — do not commit
 .observability-poc-aws.state
+
+# Basic auth material — managed in AWS Secrets Manager via External Secrets Operator
+**/.htpasswd
+loki/.htpasswd
+mimir/.htpasswd

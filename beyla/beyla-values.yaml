@@ -1,0 +1,53 @@
+# Grafana Beyla — eBPF auto-instrumentation (traces + metrics → Alloy OTLP).
+# Chart: grafana/beyla  |  Docs: https://grafana.com/docs/beyla/latest/setup/kubernetes-helm/
+#
+# Install Alloy first (`make install-alloy`), then: make install-beyla
+
+privileged: true
+preset: application
+
+config:
+  create: true
+  data:
+    attributes:
+      kubernetes:
+        enable: true
+    # Restrict to namespaces you care about; "*" instruments the whole cluster.
+    # Prefer listing app namespaces in production to cut noise/cost.
+    discovery:
+      instrument:
+        - k8s_namespace: "*"
+    routes:
+      unmatched: heuristic
+    # OTLP gRPC into Alloy (extraPorts.otlp-grpc / 4317)
+    otel_traces_export:
+      endpoint: http://grafana-alloy.alloy-logs.svc.cluster.local:4317
+    otel_metrics_export:
+      endpoint: http://grafana-alloy.alloy-logs.svc.cluster.local:4317
+      features:
+        - application
+        - application_span
+        - application_service_graph
+        - application_host
+    filter:
+      network:
+        k8s_dst_owner_name:
+          not_match: "{kube*,*jaeger-agent*,*prometheus*,*promtail*,*grafana-agent*,*alloy*,*beyla*,*loki*,*mimir*,*tempo*,*pyroscope*}"
+        k8s_src_owner_name:
+          not_match: "{kube*,*jaeger-agent*,*prometheus*,*promtail*,*grafana-agent*,*alloy*,*beyla*,*loki*,*mimir*,*tempo*,*pyroscope*}"
+
+env:
+  BEYLA_KUBE_METADATA_ENABLE: "true"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+service:
+  enabled: false
+
+serviceMonitor:
+  enabled: false

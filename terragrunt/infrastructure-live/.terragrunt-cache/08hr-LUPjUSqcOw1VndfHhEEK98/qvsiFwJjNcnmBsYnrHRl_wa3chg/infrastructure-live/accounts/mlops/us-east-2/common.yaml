@@ -1,0 +1,26 @@
+stage: "dev"
+env_name: "dev"
+aws_account_id: "547580490325" # change as per your aws account id
+aws_account_name: "mlops-syrax"
+account_name: "mlops-syrax"
+aws_region: "us-east-2"
+namespace: "dev"
+vpc_id: "vpc-0fa1aba16458b8007"
+public_subnets:
+  - subnet-0c544add42fae8a5a
+  - subnet-0628c9daf9ee7c1f6
+private_subnets:
+  - subnet-0de3e0838e5edf42e
+  - subnet-02035c67fa1db278e
+db_subnets:
+  - subnet-0d61890f52446e1e7
+  - subnet-02215c8b1d0748327
+redis_security_group_ids:
+  - "sg-01c863c1741a84c0b"
+# db_password: "Qwerty2254@@1"
+# rds_security_group_id: "sg-017b29e5cb216b7c2"
+
+tags:
+  Org : "SystemEngg"
+  Pod : "DevOps"
+
