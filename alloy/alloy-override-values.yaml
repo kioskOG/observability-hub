@@ -8,6 +8,32 @@ kafka:
   topic: &kafka_topic "alloy-otel-logs"
   clientId: &kafka_client_id "grafana-alloy-logs"
 
+# -- Trace sampling (applied ONCE before Tempo + spanlogs fan-out).
+# Spanmetrics / servicegraph stay on the unsampled path (full-fidelity RED + topology).
+# Operator runbook: docs/trace-to-logs.md
+#
+# mode:
+#   off  — keep 100% of traces (dev / bring-up / Trace→Logs demos)
+#   head — otelcol.processor.probabilistic_sampler (hash on trace ID; correct on DaemonSet)
+#   tail — otelcol.processor.tail_sampling (errors + latency + probabilistic baseline)
+#          NOTE: Alloy controller.type is daemonset — all spans for a trace should hit the
+#          same Alloy pod for accurate tail decisions (trace-ID-aware LB, or single replica).
+#          If spans are spread across nodes, prefer mode=head.
+traceSampling:
+  mode: "head" #"off"
+  head:
+    # Percentage of traces to keep (0–100). Same trace ID → same decision on every pod.
+    percentage: 10
+    hashSeed: 22
+  tail:
+    decisionWait: 10s
+    numTraces: 50000
+    expectedNewTracesPerSec: 100
+    # Always keep error / high-latency traces; sample the rest probabilistically.
+    keepErrors: true
+    latencyThresholdMs: 500
+    probabilisticPercentage: 10
+
 # -- Overrides the chart's namespace.
 namespaceOverride: null
 
@@ -379,7 +405,8 @@ alloy:
           }
         }
         stage.regex {
-          expression = "(?:trace_id|TraceID|traceID)[^a-zA-Z0-9]*(?P<trace_id>[0-9a-fA-F]{32})|(?:span_id|SpanID|spanID)[^a-zA-Z0-9]*(?P<span_id>[0-9a-fA-F]{16})"
+          // OpenTelemetry / common app conventions → structured metadata (never stream labels).
+          expression = "(?:trace_id|TraceID|traceID|tid)[^a-zA-Z0-9]*(?P<trace_id>[0-9a-fA-F]{16,32})|(?:span_id|SpanID|spanID)[^a-zA-Z0-9]*(?P<span_id>[0-9a-fA-F]{16})"
         }
         stage.structured_metadata {
           values = {
@@ -545,15 +572,75 @@ alloy:
           ]
         }
         output {
-          traces  = [
+          // Sampled path → Tempo + spanlogs (see traceSampling.*).
+          // Unsampled path → spanmetrics + servicegraph (keep full-fidelity RED / topology).
+          traces = [
+            {{- if eq .Values.traceSampling.mode "head" }}
+            otelcol.processor.probabilistic_sampler.head.input,
+            {{- else if eq .Values.traceSampling.mode "tail" }}
+            otelcol.processor.tail_sampling.default.input,
+            {{- else }}
             otelcol.processor.batch.default.input,
             otelcol.connector.spanlogs.default.input,
+            {{- end }}
             otelcol.connector.spanmetrics.default.input,
             otelcol.connector.servicegraph.default.input,
           ]
           metrics = [otelcol.processor.batch.default.input]
         }
       }
+      {{- if eq .Values.traceSampling.mode "head" }}
+      // Head sampling: consistent hash on trace ID (DaemonSet-safe). Output fans out once
+      // to Tempo (via batch) and spanlogs so both shrink together.
+      otelcol.processor.probabilistic_sampler "head" {
+        sampling_percentage = {{ .Values.traceSampling.head.percentage | float64 }}
+        hash_seed           = {{ .Values.traceSampling.head.hashSeed }}
+        output {
+          traces = [
+            otelcol.processor.batch.default.input,
+            otelcol.connector.spanlogs.default.input,
+          ]
+        }
+      }
+      {{- else if eq .Values.traceSampling.mode "tail" }}
+      // Tail sampling: decide after decision_wait. Policies are OR'd (any match → keep).
+      otelcol.processor.tail_sampling "default" {
+        decision_wait              = "{{ .Values.traceSampling.tail.decisionWait }}"
+        num_traces                 = {{ .Values.traceSampling.tail.numTraces }}
+        expected_new_traces_per_sec = {{ .Values.traceSampling.tail.expectedNewTracesPerSec }}
+        {{- if .Values.traceSampling.tail.keepErrors }}
+        policy {
+          name = "keep-errors"
+          type = "status_code"
+          status_code {
+            status_codes = ["ERROR"]
+          }
+        }
+        {{- end }}
+        {{- if gt (int .Values.traceSampling.tail.latencyThresholdMs) 0 }}
+        policy {
+          name = "keep-slow"
+          type = "latency"
+          latency {
+            threshold_ms = {{ .Values.traceSampling.tail.latencyThresholdMs }}
+          }
+        }
+        {{- end }}
+        policy {
+          name = "probabilistic-baseline"
+          type = "probabilistic"
+          probabilistic {
+            sampling_percentage = {{ .Values.traceSampling.tail.probabilisticPercentage | float64 }}
+          }
+        }
+        output {
+          traces = [
+            otelcol.processor.batch.default.input,
+            otelcol.connector.spanlogs.default.input,
+          ]
+        }
+      }
+      {{- end }}
       // https://grafana.com/docs/tempo/latest/configuration/grafana-alloy/span-metrics/#generate-metrics-from-spans
       otelcol.connector.spanmetrics "default" {
         dimension {
@@ -632,22 +719,87 @@ alloy:
         }
       }
       {{- end }}
+      // ---------------------------------------------------------------------------
+      // Trace → Logs (spanlogs) — production correlation path
+      // ---------------------------------------------------------------------------
+      // Design:
+      //   • Synthetic span logs live in dedicated Loki tenant "traces" (isolation).
+      //   • Low-cardinality stream labels only: job, signal, source, service_name (+ external_labels).
+      //   • High-cardinality IDs (trace_id) → structured metadata (never stream labels).
+      //   • Body uses stable keys (trace_id=, service_name=) via spanlogs overrides.
+      //   • Tempo → Logs queries structured metadata (fast); line |= is a fallback only.
+      // Application container logs remain on namespace tenants (separate, real logs).
+      // ---------------------------------------------------------------------------
       otelcol.exporter.loki "spanlogs_to_loki" {
+        forward_to = [loki.process.spanlogs_tenant.receiver]
+      }
+      loki.process "spanlogs_tenant" {
+        stage.tenant { value = "traces" }
+
+        stage.static_labels {
+          values = {
+            job    = "spanlogs",
+            signal = "traces",
+            source = "otelcol.connector.spanlogs",
+          }
+        }
+
+        // Accept both production keys (trace_id=) and legacy tid= during rollout.
+        stage.regex {
+          expression = "(?:trace_id|tid)=(?P<trace_id>[0-9a-fA-F]{16,32})"
+        }
+        stage.regex {
+          expression = "(?:service_name|svc)=(?P<service_name>[^\\s\"]+)"
+        }
+        stage.regex {
+          expression = "span(?:_name)?=\"(?P<span_name>[^\"]+)\""
+        }
+
+        stage.labels {
+          values = {
+            service_name = "",
+          }
+        }
+        stage.structured_metadata {
+          values = {
+            trace_id  = "trace_id",
+            span_name = "span_name",
+          }
+        }
+
         forward_to = [loki.write.loki.receiver]
       }
       otelcol.connector.spanlogs "default" {
-        roots           = true
-        span_attributes = ["http.method", "http.target"]
-        labels = ["trace_id", "span_id", "service.name"]
+        // spans defaults to false — must be true or nothing is emitted.
+        // Volume warning: one log per span; for ultra-high QPS consider roots-only.
+        spans = true
+        span_attributes = [
+          "http.method",
+          "http.route",
+          "http.target",
+          "http.status_code",
+          "rpc.method",
+          "rpc.service",
+        ]
+        // Resource/span attrs only (trace id is NOT an attribute — it is written into the body).
+        labels = ["service.name"]
+        overrides {
+          trace_id_key      = "trace_id"
+          service_key       = "service_name"
+          duration_key      = "duration_ns"
+          status_key        = "status_code"
+          span_name_key     = "span_name"
+          logs_instance_tag = "kind"
+        }
         output {
           logs = [otelcol.processor.attributes.spanlogs_loki_metadata.input]
         }
       }
       otelcol.processor.attributes "spanlogs_loki_metadata" {
         action {
-          key    = "loki.resource.labels"
+          key    = "loki.attribute.labels"
           action = "insert"
-          value  = "k8s.namespace.name"
+          value  = "service.name"
         }
         output {
           logs = [
@@ -656,7 +808,7 @@ alloy:
           ]
         }
       }
-      // Span-derived logs: always to Loki; tee to Kafka when kafka.enabled=true.
+      // Span-derived logs → Loki tenant traces; optional Kafka tee when kafka.enabled=true.
       otelcol.exporter.otlp "tempo" {
         client {
           endpoint = "tempo-distributor.tempo.svc.cluster.local:4317"
@@ -688,7 +840,18 @@ alloy:
         send_batch_size     = 512
         send_batch_max_size = 1024
         output {
-          traces = [otelcol.exporter.otlp.tempo.input]
+          // Same sampled path as OTLP (Tempo + spanlogs shrink together).
+          traces = [
+            {{- if eq .Values.traceSampling.mode "head" }}
+            otelcol.processor.probabilistic_sampler.head.input,
+            {{- else if eq .Values.traceSampling.mode "tail" }}
+            otelcol.processor.tail_sampling.default.input,
+            {{- else }}
+            otelcol.exporter.otlp.tempo.input,
+            otelcol.connector.spanlogs.default.input,
+            {{- end }}
+          ]
+          // Faro SDK events/logs → Loki tenant "frontend" (separate from spanlogs).
           logs   = [otelcol.exporter.loki.faro_to_loki.input]
         }
       }

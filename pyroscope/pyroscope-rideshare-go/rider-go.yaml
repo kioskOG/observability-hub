@@ -36,7 +36,7 @@ spec:
         - name: OTEL_TRACES_EXPORTER
           value: "otlp_proto_grpc"
         - name: REGION
-          value: "us-east"
+          value: "us-east-2"
         - name: PARAMETERS_POOL_SIZE
           value: "1000"
         - name: PARAMETERS_POOL_BUFFER_SIZE_KB
@@ -47,6 +47,8 @@ spec:
           value: "http://grafana-alloy.alloy-logs.svc.cluster.local:4317"
         - name: OTEL_EXPORTER_OTLP_INSECURE
           value: "true"
+        - name: OTEL_SERVICE_NAME
+          value: "rider"
         - name: PYROSCOPE_APPLICATION_NAME
           value: "rider"
         - name: PYROSCOPE_SERVER_ADDRESS

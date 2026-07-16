@@ -206,14 +206,32 @@ Prefer **`make aws-destroy`** for buckets; drop the four `*ServiceAccountRole` b
 | Kubernetes events | **`k8s_namespace_name`** label (namespace of the involved object; may be `cluster` when empty) |
 | Alloy internal logging | **`alloy-logs`** |
 | Node syslog / journal (as configured) | **`platform`** |
-| OTLP span logs → Loki | **`traces`** (see `alloy-configMap` spanlogs pipeline) |
+| OTLP span logs → Loki | **`traces`** (Alloy `loki.process.spanlogs_tenant`) |
 | Loki canary | **`loki-system`** (Helm `-tenant-id`) |
 
 ### Stack behaviour (reminders)
 
 - **Loki** uses **`auth_enabled: true`**. Every HTTP call must carry **`X-Scope-OrgID`** (except where the gateway injects a default).
 - **Nginx gateway** forwards **`X-Scope-OrgID`**; if the client omits it, the map defaults to **`loki-system`** (`loki/loki-override-values.yaml` → `gateway.nginxConfig.httpSnippet`).
-- **Tempo → Logs** links use the datasource **`uid: loki`** by default; that datasource queries whichever tenant you set there (e.g. `default`). For trace-to-logs into other namespaces, add another Loki datasource with the matching **`X-Scope-OrgID`** and point **Explore** or derived-field config at it if needed.
+- **Trace ↔ Logs:** full operator runbook — deploy, generate traffic (Beyla/nginx, rider, Faro), sampling (`off`/`head`/`tail`), Grafana queries, troubleshooting, contributor checklist → **[`docs/trace-to-logs.md`](docs/trace-to-logs.md)**.
+
+### How to test Tempo ↔ Loki correlation (short)
+
+See the full runbook: [`docs/trace-to-logs.md`](docs/trace-to-logs.md) §3 Quick start.
+
+```bash
+# 1) For demos, keep all traces (alloy-override-values.yaml → traceSampling.mode: "off")
+make install-alloy
+make install-beyla   # if using nginx / uninstrumented HTTP
+
+# 2) Generate traffic (Beyla+nginx, rider, or make pf-faro + faro example HTML)
+
+# 3) Grafana Explore:
+#    Tempo → open span → "Logs for this span"
+#    Loki (traces / spanlogs): {job="spanlogs"} | trace_id=`<id>`
+```
+
+Then set `traceSampling.mode: head` again for production-like volume.
 
 ---
 
