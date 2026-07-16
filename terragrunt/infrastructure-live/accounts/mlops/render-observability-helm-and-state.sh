@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Render Helm *-override-values.yaml + .observability-poc-aws.state from the
-# existing Terragrunt layout (us-east-2/s3/millenniumfalcon-* + global/iam/role).
+# Render Helm *-override-values.yaml from the existing Terragrunt layout
+# (us-east-2/s3/millenniumfalcon-* + global/iam/role).
+#
+# Cluster / region come from the environment (or Makefile-resolved values), not a state file:
+#   CLUSTER_NAME / OBSERVABILITY_CLUSTER_NAME
+#   AWS_REGION / REGION / OBSERVABILITY_CLUSTER_REGION
+#
+# Optionally writes .observability-poc-aws.state for legacy cleanup-aws.sh --from-state
+# (deprecated — prefer env + naming convention for teardown).
+# Set WRITE_OBSERVABILITY_STATE=0 to skip writing that file.
 #
 # Does not create AWS resources — run the S3 + IAM stacks first.
 set -euo pipefail
@@ -27,10 +35,12 @@ require_cmd envsubst
 require_cmd jq
 
 ACCOUNT_ID="$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text)"
-CLUSTER_NAME="${OBSERVABILITY_CLUSTER_NAME:-millenniumfalcon}"
+CLUSTER_NAME="${CLUSTER_NAME:-${OBSERVABILITY_CLUSTER_NAME:-millenniumfalcon}}"
 CLUSTER_LOWER="$(echo "${CLUSTER_NAME}" | tr '[:upper:]' '[:lower:]')"
-REGION_NAME="${OBSERVABILITY_CLUSTER_REGION:-us-east-2}"
+REGION_NAME="${AWS_REGION:-${REGION:-${OBSERVABILITY_CLUSTER_REGION:-us-east-2}}}"
 S3_BUCKET_REGION="${OBSERVABILITY_S3_REGION:-${REGION_NAME}}"
+
+echo "ℹ️  Rendering with CLUSTER_NAME=${CLUSTER_NAME} region=${REGION_NAME} s3_region=${S3_BUCKET_REGION}"
 
 export s3_bucket_region="${S3_BUCKET_REGION}"
 export env_loki_chunk_bucket="${CLUSTER_LOWER}-loki-chunks"
@@ -63,10 +73,13 @@ envsubst "${OBSERVABILITY_ENVSUBST_FORMAT}" < "${REPO_ROOT}/mimir/mimir-values-t
 envsubst "${OBSERVABILITY_ENVSUBST_FORMAT}" < "${REPO_ROOT}/tempo/tempo-values-template.yaml" > "${REPO_ROOT}/tempo/tempo-override-values.yaml"
 envsubst "${OBSERVABILITY_ENVSUBST_FORMAT}" < "${REPO_ROOT}/pyroscope/pyroscope-values-template.yaml" > "${REPO_ROOT}/pyroscope/pyroscope-override-values.yaml"
 
-STATE_FILE="${OBSERVABILITY_STATE_FILE:-${REPO_ROOT}/.observability-poc-aws.state}"
-umask 077
-cat > "${STATE_FILE}" <<EOF
-# observability-hub — generated from Terragrunt s3 + iam/role layout
+# Optional legacy inventory for cleanup-aws.sh --from-state (not used by Makefile).
+if [[ "${WRITE_OBSERVABILITY_STATE:-1}" == "1" ]]; then
+  STATE_FILE="${OBSERVABILITY_STATE_FILE:-${REPO_ROOT}/.observability-poc-aws.state}"
+  umask 077
+  cat > "${STATE_FILE}" <<EOF
+# DEPRECATED optional inventory for cleanup-aws.sh --from-state.
+# Makefile resolves CLUSTER_NAME/REGION from env → kubectl → aws (see scripts/resolve-cluster-env.sh).
 OBSERVABILITY_STATE_VERSION=1
 provision_aws=terragrunt
 cluster_name=${CLUSTER_NAME}
@@ -84,8 +97,9 @@ mimir_role_arn=${mimir_role_arn}
 tempo_role_arn=${tempo_role_arn}
 pyroscope_role_arn=${pyroscope_role_arn}
 EOF
+  echo "📝 Wrote optional legacy inventory ${STATE_FILE} (Makefile does not require it)"
+fi
 
-echo "📝 Wrote ${STATE_FILE}"
 echo "✅ IRSA role ARNs:"
 echo "  Loki     : ${loki_role_arn}"
 echo "  Mimir    : ${mimir_role_arn}"

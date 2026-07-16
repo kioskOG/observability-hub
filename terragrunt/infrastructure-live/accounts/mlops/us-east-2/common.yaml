@@ -1,6 +1,6 @@
 stage: "dev"
 env_name: "dev"
-aws_account_id: "547580490325" # change as per your aws account id
+aws_account_id: "<AWS_ACOUNT_ID>" # change as per your aws account id
 aws_account_name: "mlops-syrax"
 account_name: "mlops-syrax"
 aws_region: "us-east-2"
@@ -15,10 +15,6 @@ private_subnets:
 db_subnets:
   - subnet-0c4bc57acdc51669d
   - subnet-04a7ce08f0f9f63d7
-redis_security_group_ids:
-  - "sg-01c863c1741a84c0b"
-# db_password: "Qwerty2254@@1"
-# rds_security_group_id: "sg-017b29e5cb216b7c2"
 
 tags:
   Org : "SystemEngg"

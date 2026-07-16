@@ -19,12 +19,13 @@ REGION="${REGION:-${AWS_REGION:-}}"
 PREFIX="${ESO_SECRET_PREFIX:-observability-hub}"
 
 if [[ -z "${REGION}" ]]; then
-  if [[ -f ./.observability-poc-aws.state ]]; then
-    REGION="$(grep -E '^region_name=' ./.observability-poc-aws.state | cut -d= -f2- | tr -d '\r' | head -1)"
+  # Prefer live discovery (same as Makefile) over a local state file.
+  if [[ -x ./scripts/resolve-cluster-env.sh ]]; then
+    REGION="$(./scripts/resolve-cluster-env.sh region 2>/dev/null || true)"
   fi
 fi
 if [[ -z "${REGION}" ]]; then
-  echo "ERROR: set REGION or AWS_REGION (or run script.sh so .observability-poc-aws.state has region_name)" >&2
+  echo "ERROR: set REGION or AWS_REGION (or point kubectl at an EKS cluster / configure aws CLI region)" >&2
   exit 1
 fi
 

@@ -71,7 +71,8 @@ flowchart LR
 
 | Path | Purpose |
 |------|---------|
-| `Makefile` | Install order, `init`, Terragrunt AWS targets, Helm installs, cleanup; passes **Prometheus `clusterName`** from `.observability-poc-aws.state` when present |
+| `Makefile` | Install order, `init`, Terragrunt AWS targets, Helm installs; resolves **CLUSTER_NAME / REGION** via env → kubectl → aws (`scripts/resolve-cluster-env.sh`) |
+| `scripts/resolve-cluster-env.sh` | Shared cluster/region resolver used by Make and seed scripts |
 | `terragrunt/` | Terraform modules + live stacks (observability S3/IRSA, plus existing platform stacks) |
 | `loki/` | Loki Helm overrides, IAM policy/trust examples |
 | `mimir/` | Mimir overrides, rules, dashboards |
@@ -100,13 +101,15 @@ Pinned chart versions live in the `Makefile` (`VERSION_*` variables).
 | `.../global/iam/role/` | `infrastructure-modules/iam` | IRSA roles (+ existing Wazuh roles) |
 
 ```bash
+export CLUSTER_NAME=millenniumfalcon AWS_REGION=us-east-2   # or rely on EKS kubecontext
+make show-env
 make aws-plan            # plan all observability S3 stacks + iam/role
-make aws-apply           # apply S3 → IAM → render Helm overrides + state file
+make aws-apply           # apply S3 → IAM → render Helm overrides
 make render-helm-values  # re-render only
 make aws-destroy         # destroy the six S3 stacks (remove IRSA entries from iam/role inputs separately)
 ```
 
-`make init` calls `make aws-apply`. Helm `*-override-values.yaml` and `.observability-poc-aws.state` are written by `render-observability-helm-and-state.sh`.
+`make init` calls `make aws-apply`. Helm `*-override-values.yaml` are rendered from **`CLUSTER_NAME` / `AWS_REGION`** (plus IAM role lookups). An optional `.observability-poc-aws.state` may still be written for legacy `cleanup-aws.sh --from-state` only — **Make does not require it**.
 
 ### AWS cleanup
 
@@ -148,7 +151,7 @@ Prefer **`make aws-destroy`** for buckets; drop the four `*ServiceAccountRole` b
 
    Install order in `make install`: **Mimir** → **kube-prometheus-stack** → **Loki** → **Tempo** → **Alloy** → **Pyroscope** → **Blackbox**.
 
-   **Prometheus external label `cluster`:** After `make init` / `make aws-apply`, `make install-kube-prometheus-stack` passes **`--set clusterName=…`** from **`cluster_name`** in **`.observability-poc-aws.state`**. Override with **`CLUSTER_NAME=my-eks make install-kube-prometheus-stack`**. Match **`KUBE_CLUSTER_NAME`** in `alloy/alloy-override-values.yaml` so metrics from Prometheus and Alloy share the same `cluster` label in Mimir.
+   **Prometheus external label `cluster`:** `make install-kube-prometheus-stack` passes **`--set clusterName=…`** from resolved **`CLUSTER_NAME`** (`make show-env`). Match **`KUBE_CLUSTER_NAME`** in `alloy/alloy-override-values.yaml` so Prometheus and Alloy share the same `cluster` label in Mimir.
 
 4. **Grafana**: kube-prometheus-stack provisions **Mimir**, **Loki** (see below), **Tempo**, **Pyroscope**. Port-forward or use ingress:
 
@@ -164,6 +167,7 @@ Prefer **`make aws-destroy`** for buckets; drop the four `*ServiceAccountRole` b
 
 | Target | Description |
 |--------|-------------|
+| `make show-env` | Print resolved `CLUSTER_NAME` / `REGION` (env → kubectl → aws → legacy state) |
 | `make init` | Helm repos, `default-storage-class`, namespaces, Mimir/Loki/canary secrets, **`apply-alloy-manifests`** |
 | `make apply-alloy-manifests` | `kubectl apply` Alloy **Secret** + **ConfigMap** (re-run after editing River config or credentials) |
 | `make install` | Full stack (after `init`) |
@@ -175,7 +179,7 @@ Prefer **`make aws-destroy`** for buckets; drop the four `*ServiceAccountRole` b
 
 `make install-alloy` always reapplies the Alloy Secret and ConfigMap before Helm upgrade so env vars and River config stay in sync.
 
-**kube-prometheus-stack:** `install-kube-prometheus-stack` adds **`--set clusterName=…`** when **`CLUSTER_NAME`** is set in the environment or read from **`.observability-poc-aws.state`** (`cluster_name=`). If neither is set, Helm uses `prometheus-values.yaml` only (see [Quick start](#quick-start)).
+**kube-prometheus-stack:** `install-kube-prometheus-stack` adds **`--set clusterName=…`** when **`CLUSTER_NAME`** is resolved (`make show-env`). If unset, Helm uses `prometheus-values.yaml` only.
 
 ---
 

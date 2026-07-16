@@ -50,18 +50,30 @@ VALUES_blackbox = ./blackbox-exporter/values.yaml
 VALUES_beyla = ./beyla/beyla-values.yaml
 
 # -------------------------------------
-# kube-prometheus-stack: Prometheus external label cluster (same as script.sh cluster_name)
-
-OBSERVABILITY_STATE_FILE ?= ./.observability-poc-aws.state
-# Written by ./script.sh → make init. Override: CLUSTER_NAME=my-eks make install-kube-prometheus-stack
-CLUSTER_NAME ?= $(shell test -f $(OBSERVABILITY_STATE_FILE) && grep -E '^cluster_name=' $(OBSERVABILITY_STATE_FILE) 2>/dev/null | cut -d= -f2- | head -1 | tr -d '\r')
-# ESO IRSA + ClusterSecretStore (same state file keys as script.sh)
-CLUSTER ?= $(CLUSTER_NAME)
-REGION ?= $(shell test -f $(OBSERVABILITY_STATE_FILE) && grep -E '^region_name=' $(OBSERVABILITY_STATE_FILE) 2>/dev/null | cut -d= -f2- | head -1 | tr -d '\r')
+# Cluster / region resolution (no required state file)
+#
+# Priority: env → kubectl/AWS discovery → legacy .observability-poc-aws.state (deprecated)
+#   export CLUSTER_NAME=my-eks AWS_REGION=us-east-2
+#   make show-env
+#
+# Canonical env vars: CLUSTER_NAME (or CLUSTER), AWS_REGION (or AWS_DEFAULT_REGION / REGION).
+RESOLVE_ENV := ./scripts/resolve-cluster-env.sh
+# Re-resolve on every make parse; pass through ambient/CLI values into the script.
+CLUSTER_NAME := $(shell CLUSTER_NAME='$(CLUSTER_NAME)' CLUSTER='$(CLUSTER)' $(RESOLVE_ENV) cluster 2>/dev/null)
+CLUSTER := $(CLUSTER_NAME)
+REGION := $(shell AWS_REGION='$(AWS_REGION)' AWS_DEFAULT_REGION='$(AWS_DEFAULT_REGION)' REGION='$(REGION)' $(RESOLVE_ENV) region 2>/dev/null)
+AWS_REGION := $(REGION)
 TMP_DIR ?= /tmp/observability-hub-eso
 ESO_SECRET_PREFIX ?= observability-hub
-# Only pass --set when non-empty so values.yaml / Helm defaults still apply when no state file exists
 HELM_KPS_CLUSTER_SET = $(if $(strip $(CLUSTER_NAME)),--set clusterName="$(CLUSTER_NAME)",)
+
+# Legacy path kept for cleanup-aws.sh --from-state only (optional artifact).
+OBSERVABILITY_STATE_FILE ?= ./.observability-poc-aws.state
+
+show-env:
+	@chmod +x $(RESOLVE_ENV)
+	@$(RESOLVE_ENV) --check || true
+	@echo "Make sees: CLUSTER_NAME='$(CLUSTER_NAME)' CLUSTER='$(CLUSTER)' REGION='$(REGION)'"
 
 # Existing Terragrunt layout (no composition module):
 #   S3  → terragrunt/.../us-east-2/s3/millenniumfalcon-*
@@ -105,10 +117,12 @@ aws-destroy:
 		(cd $(TG_S3_DIR)/$$s && terragrunt destroy -auto-approve); \
 	done
 
-# Re-render Helm *-override-values.yaml + .observability-poc-aws.state
+# Re-render Helm *-override-values.yaml from Terragrunt/IAM (uses env CLUSTER_NAME / AWS_REGION)
 render-helm-values:
 	@chmod +x $(TG_MLOPS_DIR)/render-observability-helm-and-state.sh
-	@$(TG_MLOPS_DIR)/render-observability-helm-and-state.sh "$(CURDIR)"
+	@CLUSTER_NAME="$(CLUSTER_NAME)" AWS_REGION="$(REGION)" \
+	  OBSERVABILITY_CLUSTER_NAME="$(CLUSTER_NAME)" OBSERVABILITY_CLUSTER_REGION="$(REGION)" \
+	  $(TG_MLOPS_DIR)/render-observability-helm-and-state.sh "$(CURDIR)"
 
 
 # -------------------------------------
@@ -207,7 +221,7 @@ install-mimir:
 		--debug
 
 install-kube-prometheus-stack:
-	@$(if $(strip $(CLUSTER_NAME)),echo "👉 kube-prometheus-stack: clusterName=$(CLUSTER_NAME) (from $(OBSERVABILITY_STATE_FILE) or env CLUSTER_NAME)";,echo "👉 kube-prometheus-stack: CLUSTER_NAME unset — using prometheus-values.yaml only";)
+	@$(if $(strip $(CLUSTER_NAME)),echo "👉 kube-prometheus-stack: clusterName=$(CLUSTER_NAME)";,echo "👉 kube-prometheus-stack: CLUSTER_NAME unset — using prometheus-values.yaml only";)
 	helm upgrade --install kube-prometheus-stack $(CHART_kps) \
 		-n $(NAMESPACE_kube-prometheus-stack) \
 		--values $(VALUES_kps) \
@@ -443,10 +457,8 @@ eso-uninstall:
 # ---------------- IRSA for ESO controller SA ----------------
 eso-iam-role:
 	@echo "🔍 Ensuring ESO IRSA Role (cluster=$(CLUSTER) region=$(REGION))"
-	@if [ -z "$(CLUSTER)" ] || [ -z "$(REGION)" ]; then \
-		echo "ERROR: CLUSTER and REGION required (from env or $(OBSERVABILITY_STATE_FILE) cluster_name / region_name)"; \
-		exit 1; \
-	fi
+	@chmod +x $(RESOLVE_ENV)
+	@$(RESOLVE_ENV) --check >/dev/null
 	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text | tr -d '\r'); \
 	oidc=$$(AWS_PAGER="" aws eks describe-cluster --name "$(CLUSTER)" --region "$(REGION)" --query "cluster.identity.oidc.issuer" --output text | tr -d '\r'); \
 	idp_id=$$(echo $$oidc | awk -F '/' '{print $$NF}' | tr -d '\r'); \
@@ -506,10 +518,8 @@ eso-seed:
 
 # Apply ClusterSecretStore + ExternalSecrets; wait until synced
 eso-apply:
-	@if [ -z "$(REGION)" ]; then \
-		echo "ERROR: REGION unset. Export REGION or run script.sh so $(OBSERVABILITY_STATE_FILE) has region_name="; \
-		exit 1; \
-	fi
+	@chmod +x $(RESOLVE_ENV)
+	@$(RESOLVE_ENV) --check >/dev/null
 	@if ! kubectl get crd externalsecrets.external-secrets.io >/dev/null 2>&1; then \
 		echo "ERROR: ExternalSecret CRD missing. Run: make eso-install"; \
 		exit 1; \
@@ -562,15 +572,16 @@ help:
 	@echo "🚀 LGTM Stack Deployment Makefile"
 	@echo ""
 	@echo "Available targets:"
+	@echo "  make show-env              - Print resolved CLUSTER_NAME / REGION (env → kubectl → aws)"
 	@echo "  make aws-plan / aws-apply  - Terragrunt plan/apply observability S3 + IRSA (replaces script.sh)"
-	@echo "  make render-helm-values    - Re-render Helm overrides + state file from Terragrunt outputs"
+	@echo "  make render-helm-values    - Re-render Helm overrides from CLUSTER_NAME / AWS_REGION + IAM"
 	@echo "  make aws-destroy           - Terragrunt destroy observability stack"
 	@echo "  make external-secrets      - Install ESO + IRSA for AWS Secrets Manager"
 	@echo "  make eso-seed              - Create/update SM secrets (htpasswd generated in-memory)"
 	@echo "  make eso-apply             - Apply ClusterSecretStore + ExternalSecrets and wait"
 	@echo "  make init                  - aws-apply + namespaces + eso-apply (no local .htpasswd)"
 	@echo "  make apply-alloy-manifests - Alias for eso-apply (credentials via ESO)"
-	@echo "  make aws-cleanup-dry-run   - List S3/IAM from state file (legacy cleanup-aws.sh)"
+	@echo "  make aws-cleanup-dry-run   - List S3/IAM (env CLUSTER_NAME/REGION or legacy state file)"
 	@echo "  make aws-cleanup           - Delete those AWS resources (type DELETE to confirm)"
 	@echo "  make install               - Install all components (incl. Beyla after Alloy)"
 	@echo "  make install-loki          - Helm upgrade Loki"
@@ -593,9 +604,10 @@ help:
 	@echo "  - Example SDK page: faro/faro-web-sdk.example.html (use make pf-faro)"
 	@echo "  - Beyla: beyla/beyla-values.yaml exports OTLP to grafana-alloy.alloy-logs:4317"
 	@echo ""
-	@echo "kube-prometheus-stack cluster label:"
-	@echo "  After make init, cluster_name from .observability-poc-aws.state is passed as Helm clusterName."
-	@echo "  Override: CLUSTER_NAME=my-eks make install-kube-prometheus-stack"
+	@echo "Cluster / region (no state file required):"
+	@echo "  Priority: env CLUSTER_NAME + AWS_REGION|REGION → kubectl EKS context → aws configure → legacy state"
+	@echo "  make show-env"
+	@echo "  CLUSTER_NAME=my-eks AWS_REGION=us-east-2 make install-kube-prometheus-stack"
 	@echo ""
 	@echo "Secrets (External Secrets Operator):"
 	@echo "  1) make external-secrets"
@@ -611,11 +623,13 @@ help:
 	@echo "    or create one datasource per tenant."
 	@echo ""
 	@echo "Examples:"
+	@echo "  export CLUSTER_NAME=millenniumfalcon AWS_REGION=us-east-2"
+	@echo "  make show-env"
 	@echo "  make aws-plan && make aws-apply"
 	@echo "  make external-secrets && make eso-seed && make init && make install"
 	@echo "  make install-loki"
 	@echo "  make aws-destroy                              # preferred teardown"
-	@echo "  make aws-cleanup-dry-run && make aws-cleanup   # legacy state-file teardown"
+	@echo "  make aws-cleanup-dry-run && make aws-cleanup   # legacy cleanup helper"
 	@echo "  make logs-tempo"
 	@echo "  make template-debug-mimir"
 	@echo ""
