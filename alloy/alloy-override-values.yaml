@@ -669,7 +669,7 @@ alloy:
       // --- Grafana Faro (RUM) ---
       // Browser Faro Web SDK → Alloy → Tempo (traces) + Loki (logs/events).
       // Expose Service port 12347 (and Ingress if browsers are outside the cluster).
-      // Requires alloy.stabilityLevel: experimental (otelcol.receiver.faro).
+      // Requires alloy.stabilityLevel: experimental and Alloy >= v1.10.0 (chart >= 1.2.0).
       otelcol.receiver.faro "rum" {
         endpoint = "0.0.0.0:12347"
         cors {
@@ -1300,8 +1300,7 @@ alloy:
         }
       }
 
-      # -- Name of existing ConfigMap to use. Used when create is false.
-
+    # -- Name of existing ConfigMap to use. Used when create is false.
     name: alloy-config
     # -- Key in ConfigMap to get config from.
     key: config.alloy

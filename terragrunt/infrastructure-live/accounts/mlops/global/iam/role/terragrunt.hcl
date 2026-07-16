@@ -6,7 +6,13 @@ terraform {
   source = "../../../../../..//infrastructure-modules/iam/"
 }
 
+locals {
+  common_vars = yamldecode(file("${get_terragrunt_dir()}/../../../us-east-2/common.yaml"))
+}
+
 inputs = {
+
+  policy_vars = local.common_vars
 
   iam_role = {
 

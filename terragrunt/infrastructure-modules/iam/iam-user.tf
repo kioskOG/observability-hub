@@ -28,7 +28,7 @@ resource "aws_iam_group_policy" "default" {
   for_each = toset(local.local_iam_user_custom_policy)
   name     = split("@", each.key)[1]
   group    = aws_iam_user.default[split("@", each.key)[0]].name
-  policy   = file("policy/${split("@", each.key)[1]}.json")
+  policy   = templatefile("policy/${split("@", each.key)[1]}.json", var.policy_vars)
 }
 
 resource "aws_iam_group_policy_attachment" "managed" {

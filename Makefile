@@ -31,7 +31,7 @@ CHART_beyla = grafana/beyla
 
 VERSION_loki  = 6.30.1
 VERSION_tempo = 1.42.2
-VERSION_alloy = 1.1.1
+VERSION_alloy = 1.2.1
 VERSION_mimir = 5.7.0
 VERSION_pyroscope = 1.14.0
 VERSION_blackbox = 11.0.0
@@ -358,7 +358,7 @@ template-debug-%:
 # -------------------------------------
 # Batch commands
 
-install: init install-mimir install-kube-prometheus-stack install-loki install-tempo install-alloy install-pyroscope install-blackbox install-beyla
+install: init install-kube-prometheus-stack install-mimir install-loki install-tempo install-alloy install-pyroscope install-blackbox install-beyla
 status: status-loki status-tempo status-alloy status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox status-beyla
 logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox logs-beyla
 template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox template-debug-beyla
@@ -384,10 +384,6 @@ ESO_ROLE_NAME          ?= ESOControllerServiceAccountRole
 ESO_POLICY_NAME        ?= ESOSecretsManagerAccessPolicy
 
 
-# =====================================================================
-# ==================== External Secrets Operator ======================
-# =====================================================================
-
 eso-init:
 	@echo "👉 Adding ESO repo and preparing namespace"
 	@AWS_PAGER="" helm repo add external-secrets $(ESO_HELM_REPO) 2>/dev/null || true
@@ -404,7 +400,37 @@ eso-install:
 	  --set installCRDs=true \
 	  --set serviceAccount.create=true \
 	  --set serviceAccount.name=$(ESO_SERVICE_ACCOUNT)
+	@$(MAKE) eso-wait-crds
 	@kubectl rollout status deploy/$(ESO_HELM_RELEASE) -n $(ESO_NAMESPACE) --timeout=3m || true
+	@$(MAKE) eso-wait-webhook
+
+# Both CRDs must be Established before applying v1 manifests.
+eso-wait-crds:
+	@echo "⏳ Waiting for ESO CRDs (ClusterSecretStore + ExternalSecret)..."
+	@kubectl wait --for=condition=Established crd/clustersecretstores.external-secrets.io --timeout=120s
+	@kubectl wait --for=condition=Established crd/externalsecrets.external-secrets.io --timeout=120s
+	@if ! kubectl api-resources --api-group=external-secrets.io 2>/dev/null | grep -q '^externalsecrets'; then \
+	  echo "ERROR: ExternalSecret CRD missing from API. Run: make eso-install"; \
+	  exit 1; \
+	fi
+
+# Validating webhook must have endpoints before ClusterSecretStore/ExternalSecret apply.
+eso-wait-webhook:
+	@echo "⏳ Waiting for ESO validating webhook endpoints..."
+	@kubectl rollout status deploy/$(ESO_HELM_RELEASE)-webhook -n $(ESO_NAMESPACE) --timeout=3m
+	@i=0; \
+	while [ $$i -lt 60 ]; do \
+	  eps=$$(kubectl get endpoints $(ESO_HELM_RELEASE)-webhook -n $(ESO_NAMESPACE) -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true); \
+	  if [ -n "$$eps" ]; then \
+	    echo "✅ Webhook ready (endpoints: $$eps)"; \
+	    exit 0; \
+	  fi; \
+	  i=$$((i+1)); \
+	  sleep 2; \
+	done; \
+	echo "ERROR: no endpoints for service $(ESO_HELM_RELEASE)-webhook in $(ESO_NAMESPACE)"; \
+	kubectl -n $(ESO_NAMESPACE) get deploy,pods,svc,endpoints || true; \
+	exit 1
 
 eso-status:
 	@kubectl -n $(ESO_NAMESPACE) get deploy,pods || true
@@ -416,21 +442,22 @@ eso-uninstall:
 
 # ---------------- IRSA for ESO controller SA ----------------
 eso-iam-role:
-	@echo "🔍 Ensuring ESO IRSA Role"
+	@echo "🔍 Ensuring ESO IRSA Role (cluster=$(CLUSTER) region=$(REGION))"
 	@if [ -z "$(CLUSTER)" ] || [ -z "$(REGION)" ]; then \
 		echo "ERROR: CLUSTER and REGION required (from env or $(OBSERVABILITY_STATE_FILE) cluster_name / region_name)"; \
 		exit 1; \
 	fi
-	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text); \
-	oidc=$$(AWS_PAGER="" aws eks describe-cluster --name "$(CLUSTER)" --region "$(REGION)" --query "cluster.identity.oidc.issuer" --output text); \
-	idp_id=$$(echo $$oidc | awk -F '/' '{print $$NF}'); \
+	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text | tr -d '\r'); \
+	oidc=$$(AWS_PAGER="" aws eks describe-cluster --name "$(CLUSTER)" --region "$(REGION)" --query "cluster.identity.oidc.issuer" --output text | tr -d '\r'); \
+	idp_id=$$(echo $$oidc | awk -F '/' '{print $$NF}' | tr -d '\r'); \
 	mkdir -p $(TMP_DIR); \
 	printf '%s' '{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "Federated": "arn:aws:iam::'$$account_id':oidc-provider/oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id'" }, "Action": "sts:AssumeRoleWithWebIdentity", "Condition": { "StringEquals": { "oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id':sub": "system:serviceaccount:$(ESO_NAMESPACE):$(ESO_SERVICE_ACCOUNT)", "oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id':aud": "sts.amazonaws.com" } } } ] }' > "$(TMP_DIR)/eso-trust.json"; \
 	if AWS_PAGER="" aws iam get-role --role-name "$(ESO_ROLE_NAME)" >/dev/null 2>&1; then \
-	  echo "✅ Role exists: $(ESO_ROLE_NAME)"; \
+	  AWS_PAGER="" aws iam update-assume-role-policy --role-name "$(ESO_ROLE_NAME)" --policy-document file://$(TMP_DIR)/eso-trust.json >/dev/null; \
+	  echo "✅ Updated trust on existing role: $(ESO_ROLE_NAME) (oidc=…/$$idp_id)"; \
 	else \
 	  AWS_PAGER="" aws iam create-role --role-name "$(ESO_ROLE_NAME)" --assume-role-policy-document file://$(TMP_DIR)/eso-trust.json >/dev/null; \
-	  echo "📌 Created role: $(ESO_ROLE_NAME)"; \
+	  echo "📌 Created role: $(ESO_ROLE_NAME) (oidc=…/$$idp_id)"; \
 	fi
 
 eso-iam-policy:
@@ -458,10 +485,13 @@ eso-iam-attach:
 
 eso-sa-annotate:
 	@echo "🏷  Annotating $(ESO_NAMESPACE)/$(ESO_SERVICE_ACCOUNT) with IRSA role ARN"
-	@account_id=$$(aws sts get-caller-identity --query Account --output text); \
+	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text); \
 	role_arn=$$(printf 'arn:aws:iam::%s:role/%s' "$$account_id" "$(ESO_ROLE_NAME)"); \
 	kubectl -n "$(ESO_NAMESPACE)" annotate sa "$(ESO_SERVICE_ACCOUNT)" \
-	  eks.amazonaws.com/role-arn="$$role_arn" --overwrite
+	  eks.amazonaws.com/role-arn="$$role_arn" --overwrite; \
+	echo "♻️  Restarting ESO controller so pods pick up IRSA"; \
+	kubectl -n "$(ESO_NAMESPACE)" rollout restart deploy/$(ESO_HELM_RELEASE); \
+	kubectl -n "$(ESO_NAMESPACE)" rollout status deploy/$(ESO_HELM_RELEASE) --timeout=3m
 
 eso-check-store:
 	@echo "🔎 ClusterSecretStores"
@@ -480,6 +510,20 @@ eso-apply:
 		echo "ERROR: REGION unset. Export REGION or run script.sh so $(OBSERVABILITY_STATE_FILE) has region_name="; \
 		exit 1; \
 	fi
+	@if ! kubectl get crd externalsecrets.external-secrets.io >/dev/null 2>&1; then \
+		echo "ERROR: ExternalSecret CRD missing. Run: make eso-install"; \
+		exit 1; \
+	fi
+	@if ! kubectl get crd clustersecretstores.external-secrets.io >/dev/null 2>&1; then \
+		echo "ERROR: ClusterSecretStore CRD missing. Run: make eso-install"; \
+		exit 1; \
+	fi
+	@$(MAKE) eso-wait-crds
+	@$(MAKE) eso-wait-webhook
+	@echo "👉 Ensuring namespaces for ExternalSecrets..."
+	@for ns in $(NAMESPACE_loki) $(NAMESPACE_mimir) $(NAMESPACE_alloy) $(NAMESPACE_kube-prometheus-stack); do \
+		kubectl get namespace $$ns >/dev/null 2>&1 || kubectl create namespace $$ns; \
+	done
 	@echo "👉 Applying ClusterSecretStore (region=$(REGION))"
 	@sed "s/__AWS_REGION__/$(REGION)/g" ./external-secrets/cluster-secret-store.yaml | kubectl apply -f -
 	@echo "👉 Applying ExternalSecrets"
@@ -488,6 +532,7 @@ eso-apply:
 	@kubectl apply -f ./external-secrets/externalsecret-mimir-basic-auth.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-alloy-remote-credentials.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-mimir-remote-write.yaml
+	@kubectl apply -f ./external-secrets/externalsecret-grafana-auth.yaml
 	@$(MAKE) eso-wait
 
 eso-wait:
@@ -497,7 +542,13 @@ eso-wait:
 	@kubectl wait --for=condition=Ready externalsecret/mimir-basic-auth -n $(NAMESPACE_mimir) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/alloy-remote-credentials -n $(NAMESPACE_alloy) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
+	@kubectl wait --for=condition=Ready externalsecret/grafana-auth-secrets -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
 	@echo "✅ ExternalSecrets synced"
+	@if kubectl get deploy kube-prometheus-stack-grafana -n $(NAMESPACE_kube-prometheus-stack) >/dev/null 2>&1; then \
+	  echo "♻️  Restarting Grafana to reload datasource credentials..."; \
+	  kubectl rollout restart deploy/kube-prometheus-stack-grafana -n $(NAMESPACE_kube-prometheus-stack); \
+	  kubectl rollout status deploy/kube-prometheus-stack-grafana -n $(NAMESPACE_kube-prometheus-stack) --timeout=3m; \
+	fi
 
 # Operator + IRSA (does not create ClusterSecretStore — use eso-apply)
 external-secrets: eso-init eso-iam-role eso-iam-policy eso-iam-attach eso-install eso-sa-annotate eso-status

@@ -13,6 +13,12 @@ variable "iam_policy" {
   default = []
 }
 
+variable "policy_vars" {
+  type        = any
+  default     = {}
+  description = "Variables to pass to templatefile when evaluating custom policy JSON files"
+}
+
 variable "additional_tags" {
   type = map(any)
   default = {

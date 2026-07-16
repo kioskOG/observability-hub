@@ -1228,6 +1228,15 @@ alertmanager:
 ## Using default values from https://github.com/grafana/helm-charts/blob/main/charts/grafana/values.yaml
 ##
 grafana:
+  envValueFrom:
+    LOKI_PASSWORD:
+      secretKeyRef:
+        name: grafana-auth-secrets
+        key: LOKI_PASSWORD
+    MIMIR_PASSWORD:
+      secretKeyRef:
+        name: grafana-auth-secrets
+        key: MIMIR_PASSWORD
   enabled: true
   replicas: 2
   namespaceOverride: ""
@@ -1237,7 +1246,7 @@ grafana:
     # -- Docker image repository
     repository: grafana/grafana
     # Overrides the Grafana image tag whose default is the chart appVersion
-    tag: "12.4.2" #"12.1.0" #"12.0.2"
+    tag: "13.1.0" #"12.4.2" #"12.1.0" #"12.0.2"
 
   ## ForceDeployDatasources Create datasource configmap even if grafana deployment has been disabled
   ##
@@ -1547,7 +1556,7 @@ grafana:
         basicAuth: true
         basicAuthUser: mimir-nginx
         secureJsonData:
-          basicAuthPassword: mimir-nginx
+          basicAuthPassword: $__env{MIMIR_PASSWORD}
         isDefault: false
         editable: true
       # Alloy sends pod logs with Loki tenant = pod namespace (alloy-configMap: stage.tenant { label = "namespace" }).
@@ -1561,7 +1570,7 @@ grafana:
         basicAuth: true
         basicAuthUser: loki-canary
         secureJsonData:
-          basicAuthPassword: loki-canary
+          basicAuthPassword: $__env{LOKI_PASSWORD}
           httpHeaderValue1: "default"
         isDefault: false
         version: 1
@@ -1577,7 +1586,7 @@ grafana:
         basicAuth: true
         basicAuthUser: loki-canary
         secureJsonData:
-          basicAuthPassword: loki-canary
+          basicAuthPassword: $__env{LOKI_PASSWORD}
           httpHeaderValue1: "monitoring"
         isDefault: false
         version: 1

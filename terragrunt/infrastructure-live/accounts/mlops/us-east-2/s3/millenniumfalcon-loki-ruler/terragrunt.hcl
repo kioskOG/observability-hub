@@ -12,7 +12,7 @@ inputs = {
   name        = "millenniumfalcon-loki-ruler"
   bucket_name = "millenniumfalcon-loki-ruler"
 
-  versioning_enabled = true
+  versioning_enabled = false
   sse_algorithm      = "AES256"
 
 

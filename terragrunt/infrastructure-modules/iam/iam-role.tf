@@ -10,7 +10,7 @@ resource "aws_iam_role_policy" "default" {
   for_each = toset(local.local_iam_role_custom_policy)
   name     = split("@", each.key)[1]
   role     = aws_iam_role.default[split("@", each.key)[0]].id
-  policy   = file("policy/${split("@", each.key)[1]}.json")
+  policy   = templatefile("policy/${split("@", each.key)[1]}.json", var.policy_vars)
 }
 
 resource "aws_iam_role_policy_attachment" "managed" {

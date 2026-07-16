@@ -12,7 +12,7 @@ inputs = {
   name        = "millenniumfalcon-loki-chunks"
   bucket_name = "millenniumfalcon-loki-chunks"
 
-  versioning_enabled = true
+  versioning_enabled = false
   sse_algorithm      = "AES256"
 
 

@@ -5,16 +5,16 @@ aws_account_name: "mlops-syrax"
 account_name: "mlops-syrax"
 aws_region: "us-east-2"
 namespace: "dev"
-vpc_id: "vpc-035d917483f73ec35"
+vpc_id: "vpc-0017e107935ec4b3c"
 public_subnets:
-  - subnet-034d78f1b9ad4e6ac
-  - subnet-0e270b63481aea973
+  - subnet-08a49d75fe7685b46
+  - subnet-059a86bc2ee8edde8
 private_subnets:
-  - subnet-0cbcdbf1d272c58a8
-  - subnet-002ed1f5cbb63531e
+  - subnet-0421b955659cc3fde
+  - subnet-0a2d868751f20fba4
 db_subnets:
-  - subnet-0733dde62392a8b89
-  - subnet-0cf314673db02323f
+  - subnet-0c4bc57acdc51669d
+  - subnet-04a7ce08f0f9f63d7
 redis_security_group_ids:
   - "sg-01c863c1741a84c0b"
 # db_password: "Qwerty2254@@1"
@@ -24,3 +24,9 @@ tags:
   Org : "SystemEngg"
   Pod : "DevOps"
 
+loki_chunks_bucket: "millenniumfalcon-loki-chunks"
+loki_ruler_bucket: "millenniumfalcon-loki-ruler"
+mimir_chunks_bucket: "millenniumfalcon-mimir-chunks"
+mimir_ruler_bucket: "millenniumfalcon-mimir-ruler"
+tempo_chunks_bucket: "millenniumfalcon-tempo-chunks"
+pyroscope_chunks_bucket: "millenniumfalcon-pyroscope-chunks"

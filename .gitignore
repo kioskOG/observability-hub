@@ -5,3 +5,30 @@
 **/.htpasswd
 loki/.htpasswd
 mimir/.htpasswd
+
+# Terragrunt
+.terragrunt-cache/
+**/.terragrunt-cache/
+
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+**/.terraform.d/
+
+# Terraform state (never commit)
+**/*.tfstate
+**/*.tfstate.*
+
+# macOS
+.DS_Store
+# Terragrunt
+.terragrunt-cache/
+**/.terragrunt-cache/
+
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+
+# Terraform state (never commit)
+**/*.tfstate
+**/*.tfstate.*
