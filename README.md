@@ -71,11 +71,16 @@ flowchart LR
 
 | Path | Purpose |
 |------|---------|
-| `Makefile` | Install order, `init`, per-component Helm installs, port-forwards, cleanup; passes **Prometheus `clusterName`** from `.observability-poc-aws.state` when present |
-| `loki/` | Loki Helm overrides, IAM policy/trust examples, `.htpasswd` (not committed if you create locally) |
-| `mimir/` | Mimir overrides, rules, dashboards, Prometheus remote_write secret template |
+| `Makefile` | Install order, `init`, Terragrunt AWS targets, Helm installs; resolves **CLUSTER_NAME / REGION** via env → kubectl → aws (`scripts/resolve-cluster-env.sh`) |
+| `scripts/resolve-cluster-env.sh` | Shared cluster/region resolver used by Make and seed scripts |
+| `terragrunt/` | Terraform modules + live stacks (observability S3/IRSA, plus existing platform stacks) |
+| `loki/` | Loki Helm overrides, IAM policy/trust examples |
+| `mimir/` | Mimir overrides, rules, dashboards |
 | `tempo/` | Tempo overrides, trace demo app, optional templates |
-| `alloy/` | Alloy Helm overrides, `alloy-configMap.yml` (River config), `alloy-remote-credentials-secret.yaml` |
+| `alloy/` | Alloy Helm overrides (River config in `alloy-override-values.yaml`; Faro RUM on `:12347`) |
+| `beyla/` | Grafana Beyla eBPF auto-instrumentation → Alloy OTLP |
+| `faro/` | Faro Web SDK example page for browser RUM |
+| `external-secrets/` | ClusterSecretStore + ExternalSecrets + `seed-aws-secrets.sh` (AWS Secrets Manager) |
 | `pyroscope/` | Pyroscope overrides, sample apps, IAM examples |
 | `kube-prometheus-stack/` | Local chart / values for Prometheus Operator + Grafana |
 | `blackbox-exporter/` | Blackbox values |
@@ -86,35 +91,29 @@ Pinned chart versions live in the `Makefile` (`VERSION_*` variables).
 
 ---
 
-## `script.sh` (optional AWS bootstrap)
+## AWS bootstrap (Terragrunt — existing modules)
 
-`make init` runs `./script.sh` first. The script can **generate** IRSA trust/policy JSON and **render** `*-override-values.yaml` from templates using your cluster name, region, and bucket names.
+`script.sh` is **deprecated**. Observability AWS resources use the same Terragrunt layout as the rest of the account:
 
-**It will ask before changing AWS:** whether to **provision S3 buckets and IAM** (create policies, roles, attachments) via the AWS CLI, or to **skip** all mutating calls and only write files on disk (for Terraform, CloudFormation, Console, or existing roles).
+| Path | Module | Purpose |
+|------|--------|---------|
+| `.../us-east-2/s3/millenniumfalcon-*` | `infrastructure-modules/s3` | Loki/Mimir/Tempo/Pyroscope buckets |
+| `.../global/iam/role/` | `infrastructure-modules/iam` | IRSA roles (+ existing Wazuh roles) |
 
-- **Interactive (default):** answer `y` to provision, or `N` (Enter) to skip.
-- **Non-interactive:** set the environment variable before `make init`:
-  - `export OBSERVABILITY_PROVISION_AWS=no` — no `s3 mb`, no `iam create-*` / `attach-role-policy`; you must paste existing **IRSA role ARNs** when prompted.
-  - `export OBSERVABILITY_PROVISION_AWS=yes` — same behavior as answering `y` (full provisioning).
+```bash
+export CLUSTER_NAME=millenniumfalcon AWS_REGION=us-east-2   # or rely on EKS kubecontext
+make show-env
+make aws-plan            # plan all observability S3 stacks + iam/role
+make aws-apply           # apply S3 → IAM → render Helm overrides
+make render-helm-values  # re-render only
+make aws-destroy         # destroy the six S3 stacks (remove IRSA entries from iam/role inputs separately)
+```
 
-Skipping provisioning still uses **read-only** calls: `sts get-caller-identity` and `eks describe-cluster` (for OIDC issuer ID in trust policies).
+`make init` calls `make aws-apply`. Helm `*-override-values.yaml` are rendered from **`CLUSTER_NAME` / `AWS_REGION`** (plus IAM role lookups). An optional `.observability-poc-aws.state` may still be written for legacy `cleanup-aws.sh --from-state` only — **Make does not require it**.
 
-After `script.sh` completes, it writes **`.observability-poc-aws.state`** (gitignored) with bucket names and region so you can tear down AWS without re-entering inputs.
+### AWS cleanup
 
-### AWS POC cleanup (`cleanup-aws.sh`)
-
-Removes the **S3 buckets** and **IAM roles/policies** this repo’s provision path creates (not Helm/Kubernetes — use `make uninstall-all` for that).
-
-| Command | What it does |
-|--------|----------------|
-| `make aws-cleanup-dry-run` | Lists which buckets/roles/policies **exist** and would be deleted. Uses `.observability-poc-aws.state` if present. |
-| `make aws-cleanup` | Same discovery, then you must type **`DELETE`** to proceed (or set `OBSERVABILITY_AWS_CLEANUP_CONFIRM=DELETE`). |
-| `./cleanup-aws.sh --dry-run` | Prompts for names (like `script.sh`) if no state file. |
-| `./cleanup-aws.sh --from-state` | Load names from `.observability-poc-aws.state`. |
-
-Deletion order: detach all policies from the four IRSA roles, delete roles, delete customer-managed policies `LokiS3AccessPolicy`, `MimirS3AccessPolicy`, `TempoS3AccessPolicy`, `PyroscopeS3AccessPolicy`, then `aws s3 rb … --force` on each bucket.
-
-If a policy is still attached to another role in your account, policy deletion may warn and skip — detach it manually.
+Prefer **`make aws-destroy`** for buckets; drop the four `*ServiceAccountRole` blocks from `global/iam/role/terragrunt.hcl` and re-apply that stack to remove IRSA. Legacy `cleanup-aws.sh` still works against `.observability-poc-aws.state`.
 
 ---
 
@@ -127,7 +126,7 @@ If a policy is still attached to another role in your account, policy deletion m
   - **S3** buckets for Loki (chunks + ruler), Mimir, Tempo, Pyroscope (names in your values files).
   - **IAM roles** annotated on service accounts (see `loki-s3-policy.json`, `*-trust-policy.json` under each component directory).
   - **EBS CSI** driver and a **StorageClass** (repo includes `default-storage-class.yaml` for `gp2-standard`).
-- Local tools: `htpasswd` (Apache) for gateway basic auth files, optional `aws` CLI for IAM/S3.
+- Local tools: `aws` CLI (IAM/S3/Secrets Manager), optional `htpasswd`/`jq` for `make eso-seed`.
 
 ---
 
@@ -135,22 +134,24 @@ If a policy is still attached to another role in your account, policy deletion m
 
 1. **Clone** and **edit** Helm values for your account: S3 bucket names, AWS region, IAM role ARNs (`eks.amazonaws.com/role-arn` in values), and hostnames where relevant.
 
-2. **Create auth material** (once per environment):
-   - `loki/.htpasswd` — users for **Loki nginx gateway** (referenced by `loki-basic-auth` secret).
-   - `mimir/.htpasswd` — users for **Mimir nginx gateway**.
-   - Align **`alloy/alloy-remote-credentials-secret.yaml`** `loki_gateway_*` with a user/password that exists in **`loki/.htpasswd`** (Alloy uses this to push logs to `loki-gateway`).
+2. **Secrets via External Secrets Operator** (once per environment — no local `.htpasswd`):
+
+   ```bash
+   make external-secrets   # install ESO + IRSA
+   make eso-seed           # create/update AWS Secrets Manager entries (prints passwords once)
+   ```
 
 3. **Bootstrap and install everything**:
 
    ```bash
    make help          # targets and multi-tenant notes
-   make init          # repos, namespaces, secrets, Alloy Secret + ConfigMap
+   make init          # repos, namespaces, ExternalSecrets sync
    make install       # Helm installs in dependency-friendly order
    ```
 
    Install order in `make install`: **Mimir** → **kube-prometheus-stack** → **Loki** → **Tempo** → **Alloy** → **Pyroscope** → **Blackbox**.
 
-   **Prometheus external label `cluster`:** After `make init`, `make install-kube-prometheus-stack` (and `make install`) passes **`--set clusterName=…`** from **`cluster_name`** in **`.observability-poc-aws.state`** (written by `script.sh`). Override with **`CLUSTER_NAME=my-eks make install-kube-prometheus-stack`**. Match **`KUBE_CLUSTER_NAME`** in `alloy/alloy-override-values.yaml` so metrics from Prometheus and Alloy share the same `cluster` label in Mimir.
+   **Prometheus external label `cluster`:** `make install-kube-prometheus-stack` passes **`--set clusterName=…`** from resolved **`CLUSTER_NAME`** (`make show-env`). Match **`KUBE_CLUSTER_NAME`** in `alloy/alloy-override-values.yaml` so Prometheus and Alloy share the same `cluster` label in Mimir.
 
 4. **Grafana**: kube-prometheus-stack provisions **Mimir**, **Loki** (see below), **Tempo**, **Pyroscope**. Port-forward or use ingress:
 
@@ -166,6 +167,7 @@ If a policy is still attached to another role in your account, policy deletion m
 
 | Target | Description |
 |--------|-------------|
+| `make show-env` | Print resolved `CLUSTER_NAME` / `REGION` (env → kubectl → aws → legacy state) |
 | `make init` | Helm repos, `default-storage-class`, namespaces, Mimir/Loki/canary secrets, **`apply-alloy-manifests`** |
 | `make apply-alloy-manifests` | `kubectl apply` Alloy **Secret** + **ConfigMap** (re-run after editing River config or credentials) |
 | `make install` | Full stack (after `init`) |
@@ -177,7 +179,7 @@ If a policy is still attached to another role in your account, policy deletion m
 
 `make install-alloy` always reapplies the Alloy Secret and ConfigMap before Helm upgrade so env vars and River config stay in sync.
 
-**kube-prometheus-stack:** `install-kube-prometheus-stack` adds **`--set clusterName=…`** when **`CLUSTER_NAME`** is set in the environment or read from **`.observability-poc-aws.state`** (`cluster_name=`). If neither is set, Helm uses `prometheus-values.yaml` only (see [Quick start](#quick-start)).
+**kube-prometheus-stack:** `install-kube-prometheus-stack` adds **`--set clusterName=…`** when **`CLUSTER_NAME`** is resolved (`make show-env`). If unset, Helm uses `prometheus-values.yaml` only.
 
 ---
 
@@ -208,36 +210,72 @@ If a policy is still attached to another role in your account, policy deletion m
 | Kubernetes events | **`k8s_namespace_name`** label (namespace of the involved object; may be `cluster` when empty) |
 | Alloy internal logging | **`alloy-logs`** |
 | Node syslog / journal (as configured) | **`platform`** |
-| OTLP span logs → Loki | **`traces`** (see `alloy-configMap` spanlogs pipeline) |
+| OTLP span logs → Loki | **`traces`** (Alloy `loki.process.spanlogs_tenant`) |
 | Loki canary | **`loki-system`** (Helm `-tenant-id`) |
 
 ### Stack behaviour (reminders)
 
 - **Loki** uses **`auth_enabled: true`**. Every HTTP call must carry **`X-Scope-OrgID`** (except where the gateway injects a default).
 - **Nginx gateway** forwards **`X-Scope-OrgID`**; if the client omits it, the map defaults to **`loki-system`** (`loki/loki-override-values.yaml` → `gateway.nginxConfig.httpSnippet`).
-- **Tempo → Logs** links use the datasource **`uid: loki`** by default; that datasource queries whichever tenant you set there (e.g. `default`). For trace-to-logs into other namespaces, add another Loki datasource with the matching **`X-Scope-OrgID`** and point **Explore** or derived-field config at it if needed.
+- **Trace ↔ Logs:** full operator runbook — deploy, generate traffic (Beyla/nginx, rider, Faro), sampling (`off`/`head`/`tail`), Grafana queries, troubleshooting, contributor checklist → **[`docs/trace-to-logs.md`](docs/trace-to-logs.md)**.
+
+### How to test Tempo ↔ Loki correlation (short)
+
+See the full runbook: [`docs/trace-to-logs.md`](docs/trace-to-logs.md) §3 Quick start.
+
+```bash
+# 1) For demos, keep all traces (alloy-override-values.yaml → traceSampling.mode: "off")
+make install-alloy
+make install-beyla   # if using nginx / uninstrumented HTTP
+
+# 2) Generate traffic (Beyla+nginx, rider, or make pf-faro + faro example HTML)
+
+# 3) Grafana Explore:
+#    Tempo → open span → "Logs for this span"
+#    Loki (traces / spanlogs): {job="spanlogs"} | trace_id=`<id>`
+```
+
+Then set `traceSampling.mode: head` again for production-like volume.
 
 ---
 
 ## Secrets and credentials (checklist)
 
-| Secret / file | Namespace | Purpose |
-|---------------|-----------|---------|
-| `loki-basic-auth` from `loki/.htpasswd` | `loki` | Loki gateway basic auth |
-| `canary-basic-auth` | `loki` | Loki canary push/query user/password |
-| `mimir-basic-auth` from `mimir/.htpasswd` | `mimir` | Mimir gateway basic auth |
-| `mimir-secret-for-prometheus.yaml` | `monitoring` | Prometheus → Mimir remote_write auth |
-| `alloy-remote-credentials` | `alloy-logs` | Alloy → Loki gateway + Mimir `remote_write` basic auth |
+Auth material lives in **AWS Secrets Manager** and is synced by ExternalSecrets (`external-secrets/`). Do not commit `.htpasswd` or Kubernetes Secret YAML with credentials.
 
-After rotating `loki/.htpasswd`, update **`alloy/alloy-remote-credentials-secret.yaml`** and run **`make apply-alloy-manifests`**, then restart or upgrade Alloy if needed.
+| K8s Secret (synced) | Namespace | AWS Secrets Manager key |
+|---------------------|-----------|-------------------------|
+| `loki-basic-auth` | `loki` | `observability-hub/loki-basic-auth` |
+| `canary-basic-auth` | `loki` | `observability-hub/loki-canary` |
+| `mimir-basic-auth` | `mimir` | `observability-hub/mimir-basic-auth` |
+| `mimir-remote-write-credentials` | `monitoring` | `observability-hub/mimir-remote-write` |
+| `alloy-remote-credentials` | `alloy-logs` | `observability-hub/alloy-remote-credentials` |
+
+Rotate in Secrets Manager (or re-run `make eso-seed`), then wait for ExternalSecret refresh (`make eso-apply` / `make eso-wait`).
 
 ---
 
 ## Grafana Alloy
 
-- **Helm values**: `alloy/alloy-override-values.yaml` (extra ports **4317/4318** OTLP, **4041** Pyroscope receive, DaemonSet, host log mounts, optional eBPF / privileged mode for profiling).
-- **River config**: `alloy/alloy-configMap.yml` → ConfigMap `alloy-config`, key `config.alloy`.
-- Collects **pod logs**, **Kubernetes events**, optional **node** logs, ships **OTLP** traces/metrics to Tempo/Mimir, **profiles** to Pyroscope, and **span logs** to Loki.
+- **Helm values**: `alloy/alloy-override-values.yaml` (extra ports **4317/4318** OTLP, **4041** Pyroscope receive, **12347** Faro RUM, DaemonSet, host log mounts, optional eBPF / privileged mode for profiling).
+- **River config**: embedded in `alloy/alloy-override-values.yaml` (`alloy.configMap.content`, managed by Helm).
+- Collects **pod logs**, **Kubernetes events**, optional **node** logs, ships **OTLP** traces/metrics to Tempo/Mimir, **profiles** to Pyroscope, **span logs** to Loki, and **Faro RUM** to Tempo + Loki (`frontend` tenant).
+- `alloy.stabilityLevel` is **`experimental`** so `otelcol.receiver.faro` can load.
+
+### Grafana Faro (frontend RUM)
+
+1. `make install-alloy` (Faro listener on Service port **faro** / **12347**).
+2. `make pf-faro` for local browser demos, or Ingress the `faro` port for production.
+3. Point the Faro Web SDK at `https://<your-collector>/collect` — see `faro/faro-web-sdk.example.html`.
+4. In Grafana Explore: Tempo for frontend spans; Loki with **X-Scope-OrgID=`frontend`** for RUM logs/events.
+5. Tighten `cors.allowed_origins` in Alloy (defaults to `*` for bring-up).
+
+### Grafana Beyla (eBPF auto-instrumentation)
+
+1. `make install-alloy` then `make install-beyla` (also part of `make install`).
+2. Values: `beyla/beyla-values.yaml` — privileged DaemonSet exports **OTLP gRPC** to `grafana-alloy.alloy-logs.svc.cluster.local:4317`.
+3. Observability namespaces are excluded from instrumentation so Beyla does not scrape itself / the LGTM plane.
+4. Traces land in Tempo; RED/service-graph style metrics go through Alloy → Mimir.
 
 ### Continuous profiling (Pyroscope)
 
@@ -280,7 +318,7 @@ You can load-test Loki with **xk6-loki** as in the original guide: point the cli
 
 ## Values templates
 
-`./script.sh` renders these with **restricted** `envsubst` (only specific `${VAR}` placeholders) so nginx `$variables` inside gateway configs are not stripped. If you run `envsubst` yourself, use the same allowlist as in `script.sh` (`OBSERVABILITY_ENVSUBST_FORMAT` in `script.sh`).
+`make render-helm-values` renders these with **restricted** `envsubst` so nginx `$variables` inside gateway configs are not stripped. See `OBSERVABILITY_ENVSUBST_FORMAT` in `terragrunt/infrastructure-live/accounts/mlops/render-observability-helm-and-state.sh`.
 
 - `loki/loki-values-template.yaml`
 - `mimir/mimir-values-template.yaml` — production-style HA defaults (replicas, PDBs, S3 `region`, distributor timeouts, etc.). **Install Mimir with Helm release name `mimir` in namespace `mimir`** (as in `make install-mimir`). The chart validates that **chart-managed Memcached** addresses in `mimir.structuredConfig` match that layout; do not replace internal `*.mimir.svc.cluster.local` names with envsubst placeholders.
@@ -296,10 +334,10 @@ After changing templates, run **`make init`** (or the `envsubst` step) to regene
 - **Loki (or other workloads) `AccessDenied: sts:AssumeRoleWithWebIdentity` on S3**: IRSA trust on the IAM role does not match the pod’s Kubernetes service account JWT (`sub`), or the ServiceAccount is missing `eks.amazonaws.com/role-arn`. Confirm:
   - `kubectl -n loki get pod loki-compactor-0 -o jsonpath='{.spec.serviceAccountName}{"\n"}'`
   - `kubectl -n loki get sa <that-name> -o yaml | grep role-arn`
-  - IAM role trust must allow `aud` = `sts.amazonaws.com` and a `sub` that matches `system:serviceaccount:<namespace>:<serviceaccount>`. This repo’s `script.sh` now generates **StringLike** `system:serviceaccount:loki:*` (and similarly for mimir/tempo/pyroscope namespaces) so Helm SA naming drift is less brittle. **Re-apply** the trust policy: `aws iam update-assume-role-policy --role-name LokiServiceAccountRole --policy-document file://loki/loki-trust-policy.json` (after regenerating JSON with the correct OIDC issuer ID for your cluster). Helm values use an explicit **`serviceAccount.name: loki`** so the SA aligns with a strict trust if you prefer `StringEquals` on `system:serviceaccount:loki:loki` only.
+  - IAM role trust must allow `aud` = `sts.amazonaws.com` and a `sub` that matches `system:serviceaccount:<namespace>:<serviceaccount>`. Trust JSON under `global/iam/role/trusted-entity/` uses **StringLike** `system:serviceaccount:{ns}:*` for loki/mimir/tempo/pyroscope.
 - **Memberlist “unexpected node” warnings**: Often stale ring members after a StatefulSet pod restart; usually clears or resolves after a rolling restart of Loki components. Not the same as IRSA/S3 errors.
 
-- **Alloy pods crash or 401 to Loki**: Check `alloy-remote-credentials` matches **`loki/.htpasswd`** and that `make apply-alloy-manifests` was applied.
+- **Alloy pods crash or 401 to Loki**: Confirm ExternalSecret `alloy-remote-credentials` is Ready and its username/password match `observability-hub/loki-basic-auth` (`make eso-check-store`, `make eso-wait`).
 - **Grafana Loki “no data”**: The provisioned datasource’s **X-Scope-OrgID** must match the **tenant Alloy wrote to** (usually the pod **namespace**). See **[Multi-tenant Loki](#multi-tenant-loki)**. Confirm with **`kubectl logs -n alloy-logs -l app.kubernetes.io/name=alloy`** (look for 401s to `loki-gateway`).
 - **Helm upgrade errors**: Run `make template-debug-<component>` to validate rendered YAML; check chart CHANGELOG for breaking changes when bumping `VERSION_*` in the Makefile.
 - **Mimir install: “chunks cache address … different from … expected”**: The **mimir-distributed** chart checks Memcached hostnames in values against its own computed Services. Use **release `mimir`** and **namespace `mimir`**, and keep **`*-chunks-cache.mimir.svc.cluster.local`** (and related) strings in generated overrides — do not leave unreplaced `${…}` placeholders in `mimir.structuredConfig` when **chunks-cache** (and other built-in caches) are enabled.

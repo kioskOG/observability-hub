@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Grafana Faro SDK — example (observability-hub)</title>
+  <!--
+    Wire the Faro Web SDK to Alloy's Faro receiver (port 12347).
+
+    In-cluster / port-forward demo:
+      kubectl -n alloy-logs port-forward svc/grafana-alloy 12347:12347
+      → url: http://localhost:12347/collect
+
+    Production: put an Ingress/ALB in front of Service port "faro" and set
+    allowed_origins on otelcol.receiver.faro in alloy-override-values.yaml.
+  -->
+  <script>
+    (function () {
+      const FARO_URL = "http://127.0.0.1:12347/collect"; // change for your Ingress host
+
+      // Prefer the official package in apps: @grafana/faro-web-sdk + @grafana/faro-web-tracing
+      // CDN bootstrap kept here so the example is copy-pasteable without a bundler.
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/@grafana/faro-web-sdk@1.12.2/dist/bundle/faro-web-sdk.iife.js";
+      s.onload = function () {
+        window.GrafanaFaroWebSdk.initializeFaro({
+          url: FARO_URL,
+          app: {
+            name: "observability-hub-demo",
+            version: "1.0.0",
+            environment: "production",
+          },
+          sessionTracking: { enabled: true },
+        });
+        console.info("Faro initialized →", FARO_URL);
+      };
+      document.head.appendChild(s);
+    })();
+  </script>
+</head>
+<body>
+  <h1>Faro RUM demo</h1>
+  <p>Open DevTools → Network and confirm POSTs to <code>/collect</code>.</p>
+  <button type="button" onclick="throw new Error('faro-demo-error')">Throw test error</button>
+</body>
+</html>

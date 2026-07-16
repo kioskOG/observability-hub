@@ -1,0 +1,11 @@
+stage: "dev"
+env_name: "dev"
+aws_account_id: "547580490325" # change as per your aws account id
+aws_account_name: "mlops-syrax"
+account_name: "mlops-syrax"
+aws_region: "us-east-2"
+namespace: "dev"
+# region: "ap-southeast-1"
+tags:
+  Org : "SystemEngg"
+  Pod : "DevOps"

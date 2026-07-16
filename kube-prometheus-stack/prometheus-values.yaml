@@ -1228,6 +1228,15 @@ alertmanager:
 ## Using default values from https://github.com/grafana/helm-charts/blob/main/charts/grafana/values.yaml
 ##
 grafana:
+  envValueFrom:
+    LOKI_PASSWORD:
+      secretKeyRef:
+        name: grafana-auth-secrets
+        key: LOKI_PASSWORD
+    MIMIR_PASSWORD:
+      secretKeyRef:
+        name: grafana-auth-secrets
+        key: MIMIR_PASSWORD
   enabled: true
   replicas: 2
   namespaceOverride: ""
@@ -1237,7 +1246,7 @@ grafana:
     # -- Docker image repository
     repository: grafana/grafana
     # Overrides the Grafana image tag whose default is the chart appVersion
-    tag: "12.4.2" #"12.1.0" #"12.0.2"
+    tag: "13.1.0" #"12.4.2" #"12.1.0" #"12.0.2"
 
   ## ForceDeployDatasources Create datasource configmap even if grafana deployment has been disabled
   ##
@@ -1510,13 +1519,17 @@ grafana:
         editable: true
         jsonData:
           httpMethod: GET
+          # Production Tempo → Logs (tenant traces / job=spanlogs).
+          # Structured-metadata filter is preferred (low scan cost once trace_id is promoted).
           tracesToLogsV2:
-            datasourceUid: "loki"
-            spanStartTimeShift: '-15m'
-            spanEndTimeShift: '15m'
-            filterByTraceID: true
-            filterBySpanID: true
-            tags: [{ key: 'service.name', value: 'service_name'}]
+            datasourceUid: "loki-traces"
+            spanStartTimeShift: '-5m'
+            spanEndTimeShift: '5m'
+            filterByTraceID: false
+            filterBySpanID: false
+            tags: []
+            customQuery: true
+            query: '{job="spanlogs"} | trace_id=`$${__trace.traceId}`'
           tracesToMetrics:
             datasourceUid: "mimir"
             spanStartTimeShift: '-1h'
@@ -1538,7 +1551,7 @@ grafana:
           spanBar:
             datasourceUid: "mimir"
           lokiSearch:
-            datasourceUid: 'loki'
+            datasourceUid: 'loki-traces'
       - name: Mimir
         type: prometheus
         access: proxy
@@ -1547,7 +1560,7 @@ grafana:
         basicAuth: true
         basicAuthUser: mimir-nginx
         secureJsonData:
-          basicAuthPassword: mimir-nginx
+          basicAuthPassword: $__env{MIMIR_PASSWORD}
         isDefault: false
         editable: true
       # Alloy sends pod logs with Loki tenant = pod namespace (alloy-configMap: stage.tenant { label = "namespace" }).
@@ -1561,13 +1574,24 @@ grafana:
         basicAuth: true
         basicAuthUser: loki-canary
         secureJsonData:
-          basicAuthPassword: loki-canary
+          basicAuthPassword: $__env{LOKI_PASSWORD}
           httpHeaderValue1: "default"
         isDefault: false
         version: 1
         editable: true
         jsonData:
           httpHeaderName1: "X-Scope-OrgID"
+          derivedFields:
+            - name: TraceID
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: "trace_id"
+              url: "$${__value.raw}"
+            - name: TraceID (line)
+              datasourceUid: tempo
+              matcherType: regex
+              matcherRegex: "(?:trace_id|TraceID|traceID)[=:\\\" ]+([0-9a-fA-F]{16,32})"
+              url: "$${__value.raw}"
       - name: Loki (monitoring)
         type: loki
         uid: loki-monitoring
@@ -1577,13 +1601,82 @@ grafana:
         basicAuth: true
         basicAuthUser: loki-canary
         secureJsonData:
-          basicAuthPassword: loki-canary
+          basicAuthPassword: $__env{LOKI_PASSWORD}
           httpHeaderValue1: "monitoring"
         isDefault: false
         version: 1
         editable: true
         jsonData:
-          httpHeaderName1: "X-Scope-OrgID" # (header name for the organization ID)
+          httpHeaderName1: "X-Scope-OrgID"
+          derivedFields:
+            - name: TraceID
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: "trace_id"
+              url: "$${__value.raw}"
+            - name: TraceID (line)
+              datasourceUid: tempo
+              matcherType: regex
+              matcherRegex: "(?:trace_id|TraceID|traceID)[=:\\\" ]+([0-9a-fA-F]{16,32})"
+              url: "$${__value.raw}"
+      # Alloy otelcol.connector.spanlogs → tenant "traces" (Tempo → Logs / lokiSearch).
+      - name: Loki (traces / spanlogs)
+        type: loki
+        uid: loki-traces
+        access: proxy
+        orgId: 1
+        url: http://loki-gateway.loki.svc.cluster.local
+        basicAuth: true
+        basicAuthUser: loki-canary
+        secureJsonData:
+          basicAuthPassword: $__env{LOKI_PASSWORD}
+          httpHeaderValue1: "traces"
+        isDefault: false
+        version: 1
+        editable: true
+        jsonData:
+          httpHeaderName1: "X-Scope-OrgID"
+          derivedFields:
+            # Primary: structured metadata / label (production path).
+            - name: TraceID
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: "trace_id"
+              url: "$${__value.raw}"
+            # Fallback: body keys trace_id= or legacy tid= (spanlogs body).
+            - name: TraceID (line)
+              datasourceUid: tempo
+              matcherType: regex
+              matcherRegex: "(?:trace_id|tid)=([0-9a-fA-F]{16,32})"
+              url: "$${__value.raw}"
+      # Faro Web SDK events/logs (Alloy faro_tenant) — not the same as spanlogs.
+      - name: Loki (frontend / Faro)
+        type: loki
+        uid: loki-frontend
+        access: proxy
+        orgId: 1
+        url: http://loki-gateway.loki.svc.cluster.local
+        basicAuth: true
+        basicAuthUser: loki-canary
+        secureJsonData:
+          basicAuthPassword: $__env{LOKI_PASSWORD}
+          httpHeaderValue1: "frontend"
+        isDefault: false
+        version: 1
+        editable: true
+        jsonData:
+          httpHeaderName1: "X-Scope-OrgID"
+          derivedFields:
+            - name: TraceID
+              datasourceUid: tempo
+              matcherType: label
+              matcherRegex: "trace_id"
+              url: "$${__value.raw}"
+            - name: TraceID (line)
+              datasourceUid: tempo
+              matcherType: regex
+              matcherRegex: "(?:trace_id|TraceID|traceID|traceId)[=:\\\" ]+([0-9a-fA-F]{16,32})"
+              url: "$${__value.raw}"
       - name: Pyroscope
         type: grafana-pyroscope-datasource
         access: proxy
