@@ -1,8 +1,37 @@
+data "aws_iam_policy_document" "irsa_trust" {
+  for_each = {
+    for k, v in var.iam_role : k => v
+    if lookup(v, "irsa_service_accounts", null) != null
+  }
+
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [var.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(var.oidc_issuer_url, "https://", "")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "${replace(var.oidc_issuer_url, "https://", "")}:sub"
+      values   = [for sa in each.value.irsa_service_accounts : "system:serviceaccount:${sa}"]
+    }
+  }
+}
+
 resource "aws_iam_role" "default" {
   for_each           = var.iam_role
   name               = each.key
   path               = "/"
-  assume_role_policy = file("trusted-entity/${each.key}.json")
+  assume_role_policy = lookup(each.value, "irsa_service_accounts", null) != null ? data.aws_iam_policy_document.irsa_trust[each.key].json : file("trusted-entity/${each.key}.json")
   tags               = var.additional_tags
 }
 

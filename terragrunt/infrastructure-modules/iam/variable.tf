@@ -36,3 +36,15 @@ variable "oidc" {
   description = "Whether to create OIDC or not"
   default     = {}
 }
+
+variable "oidc_issuer_url" {
+  type        = string
+  description = "EKS OIDC Issuer URL for IRSA trust policies"
+  default     = ""
+}
+
+variable "oidc_provider_arn" {
+  type        = string
+  description = "EKS OIDC Provider ARN for IRSA trust policies"
+  default     = ""
+}

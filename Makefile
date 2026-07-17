@@ -38,27 +38,22 @@ VERSION_blackbox = 11.0.0
 VERSION_beyla = 1.16.8
 
 # -------------------------------------
+# -------------------------------------
 # Values files
 
-VALUES_loki  = ./loki/loki-override-values.yaml
-VALUES_tempo = ./tempo/tempo-override-values.yaml
+VALUES_loki  = ./loki/loki-override-values.rendered.yaml
+VALUES_tempo = ./tempo/tempo-override-values.rendered.yaml
 VALUES_alloy = ./alloy/alloy-override-values.yaml
-VALUES_mimir = ./mimir/mimir-override-values.yaml
+VALUES_mimir = ./mimir/mimir-override-values.rendered.yaml
 VALUES_kps   = ./kube-prometheus-stack/prometheus-values.yaml
-VALUES_pyroscope = ./pyroscope/pyroscope-override-values.yaml
+VALUES_kps_override = ./kube-prometheus-stack/prometheus-override-values.rendered.yaml
+VALUES_pyroscope = ./pyroscope/pyroscope-override-values.rendered.yaml
 VALUES_blackbox = ./blackbox-exporter/values.yaml
 VALUES_beyla = ./beyla/beyla-values.yaml
 
 # -------------------------------------
-# Cluster / region resolution (no required state file)
-#
-# Priority: env → kubectl/AWS discovery → legacy .observability-poc-aws.state (deprecated)
-#   export CLUSTER_NAME=my-eks AWS_REGION=us-east-2
-#   make show-env
-#
-# Canonical env vars: CLUSTER_NAME (or CLUSTER), AWS_REGION (or AWS_DEFAULT_REGION / REGION).
+# Cluster / region resolution
 RESOLVE_ENV := ./scripts/resolve-cluster-env.sh
-# Re-resolve on every make parse; pass through ambient/CLI values into the script.
 CLUSTER_NAME := $(shell CLUSTER_NAME='$(CLUSTER_NAME)' CLUSTER='$(CLUSTER)' $(RESOLVE_ENV) cluster 2>/dev/null)
 CLUSTER := $(CLUSTER_NAME)
 REGION := $(shell AWS_REGION='$(AWS_REGION)' AWS_DEFAULT_REGION='$(AWS_DEFAULT_REGION)' REGION='$(REGION)' $(RESOLVE_ENV) region 2>/dev/null)
@@ -67,17 +62,12 @@ TMP_DIR ?= /tmp/observability-hub-eso
 ESO_SECRET_PREFIX ?= observability-hub
 HELM_KPS_CLUSTER_SET = $(if $(strip $(CLUSTER_NAME)),--set clusterName="$(CLUSTER_NAME)",)
 
-# Legacy path kept for cleanup-aws.sh --from-state only (optional artifact).
-OBSERVABILITY_STATE_FILE ?= ./.observability-poc-aws.state
-
 show-env:
 	@chmod +x $(RESOLVE_ENV)
 	@$(RESOLVE_ENV) --check || true
 	@echo "Make sees: CLUSTER_NAME='$(CLUSTER_NAME)' CLUSTER='$(CLUSTER)' REGION='$(REGION)'"
 
-# Existing Terragrunt layout (no composition module):
-#   S3  → terragrunt/.../us-east-2/s3/millenniumfalcon-*
-#   IAM → terragrunt/.../global/iam/role/  (Loki/Mimir/Tempo/Pyroscope IRSA)
+# Existing Terragrunt layout
 TG_MLOPS_DIR   ?= terragrunt/infrastructure-live/accounts/mlops
 TG_S3_DIR      ?= $(TG_MLOPS_DIR)/us-east-2/s3
 TG_IAM_ROLE_DIR ?= $(TG_MLOPS_DIR)/global/iam/role
@@ -89,35 +79,51 @@ OBS_S3_STACKS ?= \
 	millenniumfalcon-tempo-chunks \
 	millenniumfalcon-pyroscope-chunks
 
-
 # -------------------------------------
-# AWS via Terragrunt (existing s3 + iam modules / live stacks)
+# AWS via Terragrunt
+# use -auto-approve if you don't want to Approve/Reject the apply & destroy.
+# -------------------------------------
 
-aws-plan:
+aws-plan-s3:
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 plan s3/$$s"; \
 		(cd $(TG_S3_DIR)/$$s && terragrunt plan); \
 	done
+
+aws-plan-iam:
 	@echo "👉 plan global/iam/role"
 	@cd $(TG_IAM_ROLE_DIR) && terragrunt plan
 
-aws-apply:
+aws-plan: aws-plan-s3 aws-plan-iam
+
+aws-apply-s3:
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 apply s3/$$s"; \
-		(cd $(TG_S3_DIR)/$$s && terragrunt apply -auto-approve); \
+		(cd $(TG_S3_DIR)/$$s && terragrunt apply ); \
 	done
+
+aws-apply-iam:
 	@echo "👉 apply global/iam/role (includes observability IRSA)"
-	@cd $(TG_IAM_ROLE_DIR) && terragrunt apply -auto-approve
+	@cd $(TG_IAM_ROLE_DIR) && terragrunt apply
 	@$(MAKE) render-helm-values
 
-aws-destroy:
-	@echo "👉 destroy observability IRSA roles first (edit iam/role inputs if you only want LGTM roles removed)"
+aws-apply: aws-apply-s3 aws-apply-iam
+
+aws-destroy-s3:
+	@echo "👉 destroy observability S3 buckets"
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 destroy s3/$$s"; \
-		(cd $(TG_S3_DIR)/$$s && terragrunt destroy -auto-approve); \
+		(cd $(TG_S3_DIR)/$$s && terragrunt destroy); \
 	done
 
-# Re-render Helm *-override-values.yaml from Terragrunt/IAM (uses env CLUSTER_NAME / AWS_REGION)
+aws-destroy-iam:
+	@echo "👉 destroy observability IRSA roles first (edit iam/role inputs if you only want LGTM roles removed)"
+	@echo "👉 destroy global/iam/role"
+	@cd $(TG_IAM_ROLE_DIR) && terragrunt destroy
+
+aws-destroy: aws-destroy-iam aws-destroy-s3
+
+# Re-render Helm temporary values from Terragrunt
 render-helm-values:
 	@chmod +x $(TG_MLOPS_DIR)/render-observability-helm-and-state.sh
 	@CLUSTER_NAME="$(CLUSTER_NAME)" AWS_REGION="$(REGION)" \
@@ -129,64 +135,40 @@ render-helm-values:
 # Helm repo & namespace bootstrap
 
 init:
-	@echo "👉 Provisioning AWS S3 + IRSA via Terragrunt (was script.sh)..."
-	@$(MAKE) aws-apply
-
+	@echo "👉 Provisioning AWS S3 + IRSA via Terragrunt..."
+# 	@$(MAKE) aws-apply
 	@kubectl apply -f ./default-storage-class.yaml
-
 	@echo "👉 Adding Helm repo if missing and updating..."
 	@helm repo add grafana https://grafana.github.io/helm-charts || true
 	@helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 	@helm repo update
-
 	@echo "👉 Ensuring required namespaces exist..."
 	@for ns in $(NAMESPACE_loki) $(NAMESPACE_tempo) $(NAMESPACE_alloy) $(NAMESPACE_mimir) $(NAMESPACE_kube-prometheus-stack) $(NAMESPACE_pyroscope) $(NAMESPACE_blackbox) $(NAMESPACE_beyla); do \
 		if ! kubectl get namespace $$ns > /dev/null 2>&1; then \
 			echo "✅ Creating namespace: $$ns"; \
 			kubectl create namespace $$ns; \
-		else \
-			echo "⚙️  Namespace $$ns already exists. Skipping."; \
 		fi \
 	done
-
-	@echo "👉 Syncing basic-auth secrets via External Secrets Operator (no local .htpasswd)..."
+	@echo "👉 Syncing basic-auth secrets via External Secrets Operator..."
 	@if ! kubectl api-resources | grep -q '^clustersecretstores'; then \
 		echo "ERROR: External Secrets CRDs missing. Run: make external-secrets && make eso-seed && make init"; \
 		exit 1; \
 	fi
 	@$(MAKE) eso-apply
-
 	@echo "✅ All initial setup complete."
 
-
-# -------------------------------------
-# Legacy alias: credentials now come from ExternalSecrets (see eso-apply).
 apply-alloy-manifests: eso-apply
 
-
 # -------------------------------------
-# AWS POC cleanup (S3 + IAM from Terragrunt / legacy script.sh state — not Kubernetes)
+# AWS cleanup (Deprecated)
 
 aws-cleanup-dry-run:
-	@chmod +x ./cleanup-aws.sh
-	@if [ -f ./.observability-poc-aws.state ]; then \
-		echo "👉 Using .observability-poc-aws.state (dry-run)"; \
-		./cleanup-aws.sh --dry-run --from-state; \
-	else \
-		echo "👉 No state file — you will be prompted like script.sh (dry-run)"; \
-		./cleanup-aws.sh --dry-run; \
-	fi
+	@echo "DEPRECATED: Use 'make aws-destroy' via Terragrunt instead."
+	@exit 1
 
 aws-cleanup:
-	@chmod +x ./cleanup-aws.sh
-	@if [ -f ./.observability-poc-aws.state ]; then \
-		echo "👉 Using .observability-poc-aws.state"; \
-		./cleanup-aws.sh --from-state; \
-	else \
-		echo "👉 No state file — you will be prompted like script.sh"; \
-		./cleanup-aws.sh; \
-	fi
-
+	@echo "DEPRECATED: Use 'make aws-destroy' via Terragrunt instead."
+	@exit 1
 
 # -------------------------------------
 # Install Targets
@@ -225,6 +207,7 @@ install-kube-prometheus-stack:
 	helm upgrade --install kube-prometheus-stack $(CHART_kps) \
 		-n $(NAMESPACE_kube-prometheus-stack) \
 		--values $(VALUES_kps) \
+		--values $(VALUES_kps_override) \
 		$(HELM_KPS_CLUSTER_SET) \
 		--debug
 
@@ -242,7 +225,6 @@ install-blackbox:
 		--values $(VALUES_blackbox) \
 		--debug
 
-# Beyla eBPF auto-instrumentation → Alloy OTLP (requires install-alloy first)
 install-beyla:
 	helm upgrade --install beyla $(CHART_beyla) \
 		--version $(VERSION_beyla) \
@@ -250,7 +232,6 @@ install-beyla:
 		--create-namespace \
 		--values $(VALUES_beyla) \
 		--debug
-
 
 # -------------------------------------
 # Port-forward Targets
@@ -263,7 +244,6 @@ pf-prometheus:
 pf-alloy:
 	kubectl port-forward svc/grafana-alloy -n $(NAMESPACE_alloy) 12345
 
-# Faro RUM collector (browser → Alloy otelcol.receiver.faro)
 pf-faro:
 	kubectl port-forward svc/grafana-alloy -n $(NAMESPACE_alloy) 12347:12347
 
@@ -287,7 +267,6 @@ uninstall-alloy:
 uninstall-blackbox:
 	helm uninstall prometheus-blackbox-exporter -n $(NAMESPACE_blackbox) || true
 
-
 uninstall-pyroscope:
 	helm uninstall pyroscope -n $(NAMESPACE_pyroscope) || true
 
@@ -303,12 +282,9 @@ uninstall:
 	helm uninstall prometheus-blackbox-exporter -n $(NAMESPACE_blackbox) || true
 	helm uninstall beyla -n $(NAMESPACE_beyla) || true
 
-
 # Extra cleanup
-
 uninstall-cleanup:
 	@echo "🧹 Cleaning up Kubernetes resources created by this Makefile..."
-
 	@echo "🗑 Deleting ExternalSecrets + synced Secrets..."
 	-kubectl delete externalsecret loki-basic-auth canary-basic-auth -n $(NAMESPACE_loki) || true
 	-kubectl delete externalsecret mimir-basic-auth -n $(NAMESPACE_mimir) || true
@@ -344,23 +320,13 @@ uninstall-cleanup:
 
 uninstall-all: uninstall uninstall-alloy uninstall-pyroscope uninstall-blackbox uninstall-beyla uninstall-cleanup
 
-
 # -------------------------------------
-# Status Targets
-
+# Status & Logs
 status-%:
 	kubectl get all -n $(NAMESPACE_$*) || true
 
-
-# -------------------------------------
-# Logs Targets
-
 logs-%:
 	kubectl logs -n $(NAMESPACE_$*) --tail=50 -l app.kubernetes.io/name=$* || true
-
-# -------------------------------------
-# Template Debug Targets
-# Explicit kube-prometheus-stack target: pattern rule cannot use CHART_kube-prometheus-stack (hyphen parses as minus).
 
 template-debug-kube-prometheus-stack:
 	helm template kube-prometheus-stack $(CHART_kps) -n $(NAMESPACE_kube-prometheus-stack) --values $(VALUES_kps) $(HELM_KPS_CLUSTER_SET) --debug
@@ -368,17 +334,10 @@ template-debug-kube-prometheus-stack:
 template-debug-%:
 	helm template $* $(CHART_$*) -n $(NAMESPACE_$*) --values $(VALUES_$*) --debug
 
-
-# -------------------------------------
-# Batch commands
-
 install: init install-kube-prometheus-stack install-mimir install-loki install-tempo install-alloy install-pyroscope install-blackbox install-beyla
 status: status-loki status-tempo status-alloy status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox status-beyla
 logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox logs-beyla
 template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox template-debug-beyla
-
-# -------------------------------------
-
 
 # =====================================================================
 # ==================== External Secrets Operator ======================
@@ -389,16 +348,10 @@ ESO_NAMESPACE          ?= external-secrets
 ESO_HELM_REPO          ?= https://charts.external-secrets.io
 ESO_CHART              ?= external-secrets
 ESO_HELM_RELEASE       ?= external-secrets
-
-# The ServiceAccount the controller uses (chart default is "external-secrets")
 ESO_SERVICE_ACCOUNT    ?= external-secrets
 
-# IRSA for ESO controller -> access to AWS Secrets Manager
-ESO_ROLE_NAME          ?= ESOControllerServiceAccountRole
-ESO_POLICY_NAME        ?= ESOSecretsManagerAccessPolicy
-
-
 eso-init:
+	@kubectl apply -f ./default-storage-class.yaml
 	@echo "👉 Adding ESO repo and preparing namespace"
 	@AWS_PAGER="" helm repo add external-secrets $(ESO_HELM_REPO) 2>/dev/null || true
 	@AWS_PAGER="" helm repo update
@@ -408,19 +361,22 @@ eso-init:
 	fi
 
 eso-install:
-	@echo "🚀 Installing/Upgrading External Secrets Operator via Helm"
-	@AWS_PAGER="" helm upgrade --install $(ESO_HELM_RELEASE) external-secrets/$(ESO_CHART) \
+	@echo "🚀 Installing/Upgrading External Secrets Operator via Helm (consuming Terragrunt outputs)"
+	@ESO_ROLE_ARN=$$(cd $(TG_IAM_ROLE_DIR) && terragrunt output -json | jq -r '.iam_role_arns.value.ESOControllerServiceAccountRole' 2>/dev/null); \
+	echo "👉 ESO IRSA Role ARN: $$ESO_ROLE_ARN"; \
+	if [ -z "$$ESO_ROLE_ARN" ] || [ "$$ESO_ROLE_ARN" = "null" ]; then echo "ERROR: Could not fetch ESO_ROLE_ARN from Terragrunt."; exit 1; fi; \
+	AWS_PAGER="" helm upgrade --install $(ESO_HELM_RELEASE) external-secrets/$(ESO_CHART) \
 	  -n $(ESO_NAMESPACE) \
 	  --set installCRDs=true \
 	  --set serviceAccount.create=true \
-	  --set serviceAccount.name=$(ESO_SERVICE_ACCOUNT)
+	  --set serviceAccount.name=$(ESO_SERVICE_ACCOUNT) \
+	  --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$$ESO_ROLE_ARN"
 	@$(MAKE) eso-wait-crds
 	@kubectl rollout status deploy/$(ESO_HELM_RELEASE) -n $(ESO_NAMESPACE) --timeout=3m || true
 	@$(MAKE) eso-wait-webhook
 
-# Both CRDs must be Established before applying v1 manifests.
 eso-wait-crds:
-	@echo "⏳ Waiting for ESO CRDs (ClusterSecretStore + ExternalSecret)..."
+	@echo "⏳ Waiting for ESO CRDs..."
 	@kubectl wait --for=condition=Established crd/clustersecretstores.external-secrets.io --timeout=120s
 	@kubectl wait --for=condition=Established crd/externalsecrets.external-secrets.io --timeout=120s
 	@if ! kubectl api-resources --api-group=external-secrets.io 2>/dev/null | grep -q '^externalsecrets'; then \
@@ -428,7 +384,6 @@ eso-wait-crds:
 	  exit 1; \
 	fi
 
-# Validating webhook must have endpoints before ClusterSecretStore/ExternalSecret apply.
 eso-wait-webhook:
 	@echo "⏳ Waiting for ESO validating webhook endpoints..."
 	@kubectl rollout status deploy/$(ESO_HELM_RELEASE)-webhook -n $(ESO_NAMESPACE) --timeout=3m
@@ -454,69 +409,16 @@ eso-uninstall:
 	@echo "🗑  Uninstalling ESO (leaves IRSA/IAM intact)"
 	-@helm uninstall $(ESO_HELM_RELEASE) -n $(ESO_NAMESPACE) 2>/dev/null || true
 
-# ---------------- IRSA for ESO controller SA ----------------
-eso-iam-role:
-	@echo "🔍 Ensuring ESO IRSA Role (cluster=$(CLUSTER) region=$(REGION))"
-	@chmod +x $(RESOLVE_ENV)
-	@$(RESOLVE_ENV) --check >/dev/null
-	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text | tr -d '\r'); \
-	oidc=$$(AWS_PAGER="" aws eks describe-cluster --name "$(CLUSTER)" --region "$(REGION)" --query "cluster.identity.oidc.issuer" --output text | tr -d '\r'); \
-	idp_id=$$(echo $$oidc | awk -F '/' '{print $$NF}' | tr -d '\r'); \
-	mkdir -p $(TMP_DIR); \
-	printf '%s' '{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "Federated": "arn:aws:iam::'$$account_id':oidc-provider/oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id'" }, "Action": "sts:AssumeRoleWithWebIdentity", "Condition": { "StringEquals": { "oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id':sub": "system:serviceaccount:$(ESO_NAMESPACE):$(ESO_SERVICE_ACCOUNT)", "oidc.eks.$(REGION).amazonaws.com/id/'$$idp_id':aud": "sts.amazonaws.com" } } } ] }' > "$(TMP_DIR)/eso-trust.json"; \
-	if AWS_PAGER="" aws iam get-role --role-name "$(ESO_ROLE_NAME)" >/dev/null 2>&1; then \
-	  AWS_PAGER="" aws iam update-assume-role-policy --role-name "$(ESO_ROLE_NAME)" --policy-document file://$(TMP_DIR)/eso-trust.json >/dev/null; \
-	  echo "✅ Updated trust on existing role: $(ESO_ROLE_NAME) (oidc=…/$$idp_id)"; \
-	else \
-	  AWS_PAGER="" aws iam create-role --role-name "$(ESO_ROLE_NAME)" --assume-role-policy-document file://$(TMP_DIR)/eso-trust.json >/dev/null; \
-	  echo "📌 Created role: $(ESO_ROLE_NAME) (oidc=…/$$idp_id)"; \
-	fi
-
-eso-iam-policy:
-	@echo "🔧 Ensuring ESO Secrets Manager policy"
-	@printf '%s' '{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Action": [ "secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret", "secretsmanager:ListSecrets" ], "Resource": "*" } ] }' > "$(TMP_DIR)/eso-sm-policy.json"
-	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text); \
-	policy_arn=arn:aws:iam::$$account_id:policy/$(ESO_POLICY_NAME); \
-	if AWS_PAGER="" aws iam get-policy --policy-arn $$policy_arn >/dev/null 2>&1; then \
-	  echo "✅ Policy exists: $(ESO_POLICY_NAME)"; \
-	else \
-	  AWS_PAGER="" aws iam create-policy --policy-name "$(ESO_POLICY_NAME)" --policy-document file://$(TMP_DIR)/eso-sm-policy.json >/dev/null; \
-	  echo "📌 Created policy: $(ESO_POLICY_NAME)"; \
-	fi
-
-eso-iam-attach:
-	@echo "🔗 Attaching ESO policy to role"
-	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text); \
-	policy_arn=arn:aws:iam::$$account_id:policy/$(ESO_POLICY_NAME); \
-	if AWS_PAGER="" aws iam list-attached-role-policies --role-name "$(ESO_ROLE_NAME)" | grep -q "$(ESO_POLICY_NAME)"; then \
-	  echo "✅ Policy already attached"; \
-	else \
-	  AWS_PAGER="" aws iam attach-role-policy --role-name "$(ESO_ROLE_NAME)" --policy-arn $$policy_arn >/dev/null; \
-	  echo "📌 Attached policy $(ESO_POLICY_NAME) to role $(ESO_ROLE_NAME)"; \
-	fi
-
-eso-sa-annotate:
-	@echo "🏷  Annotating $(ESO_NAMESPACE)/$(ESO_SERVICE_ACCOUNT) with IRSA role ARN"
-	@account_id=$$(AWS_PAGER="" aws sts get-caller-identity --query Account --output text); \
-	role_arn=$$(printf 'arn:aws:iam::%s:role/%s' "$$account_id" "$(ESO_ROLE_NAME)"); \
-	kubectl -n "$(ESO_NAMESPACE)" annotate sa "$(ESO_SERVICE_ACCOUNT)" \
-	  eks.amazonaws.com/role-arn="$$role_arn" --overwrite; \
-	echo "♻️  Restarting ESO controller so pods pick up IRSA"; \
-	kubectl -n "$(ESO_NAMESPACE)" rollout restart deploy/$(ESO_HELM_RELEASE); \
-	kubectl -n "$(ESO_NAMESPACE)" rollout status deploy/$(ESO_HELM_RELEASE) --timeout=3m
-
 eso-check-store:
 	@echo "🔎 ClusterSecretStores"
 	@kubectl get clustersecretstores.external-secrets.io -o wide || true
 	@echo "🔎 ExternalSecrets"
 	@kubectl get externalsecrets.external-secrets.io -A || true
 
-# Seed AWS Secrets Manager (no .htpasswd written to the repo)
 eso-seed:
 	@chmod +x ./external-secrets/seed-aws-secrets.sh
 	@REGION="$(REGION)" ESO_SECRET_PREFIX="$(ESO_SECRET_PREFIX)" ./external-secrets/seed-aws-secrets.sh
 
-# Apply ClusterSecretStore + ExternalSecrets; wait until synced
 eso-apply:
 	@chmod +x $(RESOLVE_ENV)
 	@$(RESOLVE_ENV) --check >/dev/null
@@ -560,76 +462,13 @@ eso-wait:
 	  kubectl rollout status deploy/kube-prometheus-stack-grafana -n $(NAMESPACE_kube-prometheus-stack) --timeout=3m; \
 	fi
 
-# Operator + IRSA (does not create ClusterSecretStore — use eso-apply)
-external-secrets: eso-init eso-iam-role eso-iam-policy eso-iam-attach eso-install eso-sa-annotate eso-status
-
-
-
-# Help Target
+external-secrets: eso-init eso-install eso-status
 
 help:
-	@echo ""
-	@echo "🚀 LGTM Stack Deployment Makefile"
-	@echo ""
-	@echo "Available targets:"
-	@echo "  make show-env              - Print resolved CLUSTER_NAME / REGION (env → kubectl → aws)"
-	@echo "  make aws-plan / aws-apply  - Terragrunt plan/apply observability S3 + IRSA (replaces script.sh)"
-	@echo "  make render-helm-values    - Re-render Helm overrides from CLUSTER_NAME / AWS_REGION + IAM"
-	@echo "  make aws-destroy           - Terragrunt destroy observability stack"
-	@echo "  make external-secrets      - Install ESO + IRSA for AWS Secrets Manager"
-	@echo "  make eso-seed              - Create/update SM secrets (htpasswd generated in-memory)"
-	@echo "  make eso-apply             - Apply ClusterSecretStore + ExternalSecrets and wait"
-	@echo "  make init                  - aws-apply + namespaces + eso-apply (no local .htpasswd)"
-	@echo "  make apply-alloy-manifests - Alias for eso-apply (credentials via ESO)"
-	@echo "  make aws-cleanup-dry-run   - List S3/IAM (env CLUSTER_NAME/REGION or legacy state file)"
-	@echo "  make aws-cleanup           - Delete those AWS resources (type DELETE to confirm)"
-	@echo "  make install               - Install all components (incl. Beyla after Alloy)"
-	@echo "  make install-loki          - Helm upgrade Loki"
-	@echo "  make install-alloy         - eso-apply + Helm upgrade Alloy (includes Faro receiver :12347)"
-	@echo "  make install-beyla         - Beyla eBPF DaemonSet → Alloy OTLP"
-	@echo "  make pf-faro               - Port-forward Alloy Faro collector (browser RUM)"
-	@echo "  make uninstall             - Uninstall core charts (+ beyla)"
-	@echo "  make uninstall-alloy       - Uninstall Alloy separately"
-	@echo "  make uninstall-beyla       - Uninstall Beyla"
-	@echo "  make uninstall-cleanup     - Delete ExternalSecrets/Secrets, ConfigMap, Namespaces"
-	@echo "  make uninstall-all         - Uninstall everything + cleanup"
-	@echo "  make status                - Show status of all components"
-	@echo "  make logs                  - Show logs for all components"
-	@echo "  make logs-<component>      - Tail logs of a component (e.g. logs-loki)"
-	@echo "  make template-debug        - Render Helm templates for all components"
-	@echo "  make template-debug-<comp> - Debug Helm templates for a component"
-	@echo ""
-	@echo "Faro RUM / Beyla eBPF:"
-	@echo "  - Faro: Alloy otelcol.receiver.faro on :12347 → Tempo + Loki tenant frontend"
-	@echo "  - Example SDK page: faro/faro-web-sdk.example.html (use make pf-faro)"
-	@echo "  - Beyla: beyla/beyla-values.yaml exports OTLP to grafana-alloy.alloy-logs:4317"
-	@echo ""
-	@echo "Cluster / region (no state file required):"
-	@echo "  Priority: env CLUSTER_NAME + AWS_REGION|REGION → kubectl EKS context → aws configure → legacy state"
-	@echo "  make show-env"
-	@echo "  CLUSTER_NAME=my-eks AWS_REGION=us-east-2 make install-kube-prometheus-stack"
-	@echo ""
-	@echo "Secrets (External Secrets Operator):"
-	@echo "  1) make external-secrets"
-	@echo "  2) make eso-seed          # writes ONLY to AWS Secrets Manager"
-	@echo "  3) make init              # or: make eso-apply"
-	@echo "  Secret names: $(ESO_SECRET_PREFIX)/{loki-basic-auth,mimir-basic-auth,loki-canary,"
-	@echo "                alloy-remote-credentials,mimir-remote-write}"
-	@echo "  Do not commit .htpasswd or Kubernetes Secret YAML with credentials."
-	@echo ""
-	@echo "Loki multi-tenant + Grafana:"
-	@echo "  - After changing Loki values: make install-loki"
-	@echo "  - In each Grafana Loki datasource, add HTTP header X-Scope-OrgID (e.g. monitoring, default)"
-	@echo "    or create one datasource per tenant."
-	@echo ""
-	@echo "Examples:"
-	@echo "  export CLUSTER_NAME=millenniumfalcon AWS_REGION=us-east-2"
-	@echo "  make show-env"
-	@echo "  make aws-plan && make aws-apply"
-	@echo "  make external-secrets && make eso-seed && make init && make install"
-	@echo "  make install-loki"
-	@echo "  make aws-destroy                              # preferred teardown"
-	@echo "  make aws-cleanup-dry-run && make aws-cleanup   # legacy cleanup helper"
-	@echo "  make logs-tempo"
-	@echo "  make template-debug-mimir"
-	@echo ""
+	@echo "🚀 Observability Hub Deployment Makefile"
+	@echo "  make aws-apply           - Terragrunt apply for all infrastructure"
+	@echo "  make aws-destroy         - Terragrunt destroy for all infrastructure"
+	@echo "  make external-secrets    - Deploy ESO using Terragrunt IAM outputs"
+	@echo "  make eso-seed            - Create AWS Secrets Manager values"
+	@echo "  make install             - Deploy observability stack"
+	@echo "  make uninstall           - Tear down stack"

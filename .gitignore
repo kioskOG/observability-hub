@@ -32,3 +32,10 @@ mimir/.htpasswd
 # Terraform state (never commit)
 **/*.tfstate
 **/*.tfstate.*
+
+#Helm values
+**/loki-override-values.rendered.yaml
+**/tempo-override-values.rendered.yaml
+**/mimir-override-values.rendered.yaml
+**/pyroscope-override-values.rendered.yaml
+**/prometheus-override-values.rendered.yaml

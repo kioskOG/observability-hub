@@ -76,3 +76,13 @@ output "eks_access_entries" {
     type          = v.type
   } }
 }
+
+output "oidc_provider_arn" {
+  description = "The ARN of the OIDC Provider"
+  value       = aws_iam_openid_connect_provider.cluster.arn
+}
+
+output "oidc_issuer_url" {
+  description = "The URL of the OIDC Issuer"
+  value       = aws_iam_openid_connect_provider.cluster.url
+}

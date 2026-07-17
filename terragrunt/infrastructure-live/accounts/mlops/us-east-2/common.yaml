@@ -1,20 +1,20 @@
 stage: "dev"
 env_name: "dev"
-aws_account_id: "<AWS_ACOUNT_ID>" # change as per your aws account id
+aws_account_id: "<AWS_ACCOUNT_ID>" # change as per your aws account id
 aws_account_name: "mlops-syrax"
 account_name: "mlops-syrax"
 aws_region: "us-east-2"
 namespace: "dev"
-vpc_id: "vpc-0017e107935ec4b3c"
+vpc_id: "vpc-080b3aff53214e71b"
 public_subnets:
-  - subnet-08a49d75fe7685b46
-  - subnet-059a86bc2ee8edde8
+  - subnet-005e8a5feb97bdefd
+  - subnet-0e424a34efb85b664
 private_subnets:
-  - subnet-0421b955659cc3fde
-  - subnet-0a2d868751f20fba4
+  - subnet-08f4008c5ae91857f
+  - subnet-018d60a8bd815ce12
 db_subnets:
-  - subnet-0c4bc57acdc51669d
-  - subnet-04a7ce08f0f9f63d7
+  - subnet-00024ddb67c62aa42
+  - subnet-028c72e999d6282e6
 
 tags:
   Org : "SystemEngg"
