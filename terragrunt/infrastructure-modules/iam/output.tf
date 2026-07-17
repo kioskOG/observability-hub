@@ -5,6 +5,13 @@ output "iam_roles" {
   ]
 }
 
+output "iam_role_arns" {
+  description = "Map of all IAM Roles ARNs by name"
+  value = {
+    for k, role in aws_iam_role.default : k => role.arn
+  }
+}
+
 output "iam_policy" {
   description = "List of all IAM Polcies"
   value = [
