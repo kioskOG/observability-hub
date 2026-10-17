@@ -9,7 +9,9 @@ kafka:
   clientId: &kafka_client_id "grafana-alloy-logs"
 
 # -- Trace sampling (applied ONCE before Tempo + spanlogs fan-out).
-# Spanmetrics / servicegraph stay on the unsampled path (full-fidelity RED + topology).
+# Spanmetrics (RED) stay on the unsampled path (full fidelity). The service graph is built by
+# Tempo's metrics-generator from sampled traces; in head mode every kept span carries
+# sampling.ratio = percentage/100 (double) so Tempo scales edge counts by 1/ratio back to real traffic.
 # Operator runbook: docs/trace-to-logs.md
 #
 # mode:
@@ -19,6 +21,8 @@ kafka:
 #          NOTE: Alloy controller.type is daemonset — all spans for a trace should hit the
 #          same Alloy pod for accurate tail decisions (trace-ID-aware LB, or single replica).
 #          If spans are spread across nodes, prefer mode=head.
+#          Tail sampling keeps a biased subset (all errors / slow traces), so no multiplier is
+#          stamped and Tempo service-graph rates are NOT scaled in this mode.
 traceSampling:
   mode: "head" #"off"
   head:
@@ -71,20 +75,6 @@ alloy:
       // Multi-tenant Loki: tenant = Kubernetes namespace for pod logs & events; fixed tenants for platform/syslog/journal, alloy-logs, and OTLP span logs ("traces").
       // Requires loki.auth_enabled=true and credentials in Secret alloy-remote-credentials (see alloy-override-values.yaml).
       // Optional Kafka export (OTLP protobuf): set kafka.enabled=true in alloy-override-values.yaml to tee log streams to KAFKA_TOPIC via otelcol.exporter.kafka; Loki still receives the same streams directly.
-      discovery.kubernetes "pods" {
-        role = "pod"
-
-      // https://grafana.com/docs/alloy/latest/collect/prometheus-metrics/
-      // this demonstrates configuring Alloy to collect data (metrics or logs) from running production Kubernetes Pods in the default Namespace.
-      //  namespaces {
-      //    own_namespace = false
-      //    names = ["default"]
-      //  }
-      //  selectors {
-      //    role  = "pod"
-      //    label = "environment in (production)"
-      //  }
-      }
       // Pods on this node only — required for pyroscope.ebpf (profiles processes on this host; avoids huge cluster-wide target lists).
       discovery.kubernetes "pods_node_local" {
         role = "pod"
@@ -134,7 +124,8 @@ alloy:
         }
       }
       discovery.relabel "pod_logs" {
-        targets = discovery.kubernetes.pods.targets
+        // Node-local pods only: log files exist only on this node, and a cluster-wide watch per DaemonSet pod is wasted API/memory.
+        targets = discovery.kubernetes.pods_node_local.targets
         rule {
           source_labels = ["__meta_kubernetes_namespace"]
           target_label  = "namespace"
@@ -338,12 +329,8 @@ alloy:
         targets    = local.file_match.pod_logs.targets
         forward_to = [loki.process.pod_logs.receiver]
       }
-      // Kubernetes Cluster Events
-      loki.source.kubernetes_events "cluster_events" {
-        job_name   = "integrations/kubernetes/eventhandler"
-        log_format = "json"
-        forward_to = [loki.process.cluster_events.receiver]
-      }
+      // Kubernetes cluster events are NOT collected here: on a DaemonSet every pod would ship every event
+      // (N× duplicates). They are collected by the single-replica release in alloy/alloy-events-values.yaml.
       loki.process "pod_logs" {
         stage.static_labels {
           values = {
@@ -416,60 +403,6 @@ alloy:
         }
         stage.tenant {
           label = "namespace"
-        }
-        forward_to = [loki.write.loki.receiver{{- if .Values.kafka.enabled }}, otelcol.receiver.loki.kafka_bridge.receiver{{- end }}]
-      }
-      loki.process "cluster_events" {
-        stage.static_labels {
-          values = {
-            cluster     = sys.env("KUBE_CLUSTER_NAME"),
-            environment = sys.env("ENVIRONMENT_NAME"),
-            region      = sys.env("AWS_REGION"),
-          }
-        }
-        stage.replace {
-          expression = "(\"type\":\"Normal\")"
-          replace = "\"type\":\"Normal\",\"level\":\"info\""
-        }
-        stage.replace {
-          expression = "(\"type\":\"Warning\")"
-          replace = "\"type\":\"Warning\",\"level\":\"warning\""
-        }
-        stage.json {
-          expressions = {
-            k8s_resource_kind = "kind",
-            k8s_resource_name = "name",
-            k8s_event_reason  = "reason",
-            k8s_event_message = "message",
-            k8s_event_type    = "type",
-            k8s_namespace_name = "namespace",
-          }
-        }
-        stage.replace {
-          source     = "k8s_namespace_name"
-          expression = "^$"
-          replace    = "cluster"
-        }
-        stage.labels {
-          values = {
-            k8s_namespace_name = "k8s_namespace_name",
-            k8s_resource_kind  = "k8s_resource_kind",
-            k8s_event_reason   = "k8s_event_reason",
-            k8s_event_type     = "k8s_event_type",
-            k8s_resource_name  = "k8s_resource_name",
-          }
-        }
-        stage.structured_metadata {
-          values = {
-            k8s_resource_name = "k8s_resource_name",
-            k8s_event_message = "k8s_event_message",
-          }
-        }
-        stage.label_keep {
-          values = ["cluster", "environment", "region", "job", "k8s_namespace_name", "k8s_resource_kind", "k8s_event_reason", "k8s_event_type"]
-        }
-        stage.tenant {
-          label = "k8s_namespace_name"
         }
         forward_to = [loki.write.loki.receiver{{- if .Values.kafka.enabled }}, otelcol.receiver.loki.kafka_bridge.receiver{{- end }}]
       }
@@ -573,7 +506,8 @@ alloy:
         }
         output {
           // Sampled path → Tempo + spanlogs (see traceSampling.*).
-          // Unsampled path → spanmetrics + servicegraph (keep full-fidelity RED / topology).
+          // Unsampled path → spanmetrics (full-fidelity RED). The service graph is generated by Tempo's
+          // metrics-generator (needs client+server spans of one trace, i.e. trace-ID sharding).
           traces = [
             {{- if eq .Values.traceSampling.mode "head" }}
             otelcol.processor.probabilistic_sampler.head.input,
@@ -584,7 +518,6 @@ alloy:
             otelcol.connector.spanlogs.default.input,
             {{- end }}
             otelcol.connector.spanmetrics.default.input,
-            otelcol.connector.servicegraph.default.input,
           ]
           metrics = [otelcol.processor.batch.default.input]
         }
@@ -595,6 +528,18 @@ alloy:
       otelcol.processor.probabilistic_sampler "head" {
         sampling_percentage = {{ .Values.traceSampling.head.percentage | float64 }}
         hash_seed           = {{ .Values.traceSampling.head.hashSeed }}
+        output {
+          traces = [otelcol.processor.attributes.sampling_ratio.input]
+        }
+      }
+      // Tempo service_graphs.span_multiplier_key = "sampling.ratio": Tempo multiplies each sampled edge by
+      // 1/ratio. Must be a DOUBLE attribute (Tempo ignores ints) → always rendered with a decimal point.
+      otelcol.processor.attributes "sampling_ratio" {
+        action {
+          key    = "sampling.ratio"
+          action = "upsert"
+          value  = {{ printf "%.6f" (divf .Values.traceSampling.head.percentage 100) }}
+        }
         output {
           traces = [
             otelcol.processor.batch.default.input,
@@ -642,34 +587,55 @@ alloy:
       }
       {{- end }}
       // https://grafana.com/docs/tempo/latest/configuration/grafana-alloy/span-metrics/#generate-metrics-from-spans
+      // Sole producer of traces_spanmetrics_* (Tempo's span-metrics processor is disabled).
+      // CUMULATIVE is required: otelcol.exporter.prometheus / remote_write cannot represent DELTA.
+      // Per-pod series stay distinct through the `node` external label on prometheus.remote_write.
       otelcol.connector.spanmetrics "default" {
+        // Low-cardinality dimensions only: http.route is the templated route (/users/{id});
+        // the raw URL (http.target / url.path) would create one series per distinct path.
         dimension {
-          name    = "http.method"
-          default = "GET"
+          name = "http.method"
         }
         dimension {
-          name = "http.target"
+          name = "http.request.method"
         }
-        aggregation_temporality = "DELTA"
+        dimension {
+          name = "http.route"
+        }
+        aggregation_temporality = "CUMULATIVE"
         histogram {
+          unit = "s"
           explicit {
-            buckets = ["50ms", "100ms", "250ms", "1s", "5s", "10s"]
+            buckets = ["5ms", "10ms", "25ms", "50ms", "100ms", "250ms", "500ms", "1s", "2500ms", "5s", "10s"]
           }
         }
+        // Drop series for services/routes that stopped sending, so memory stays bounded.
+        metrics_expiration     = "15m"
         metrics_flush_interval = "15s"
         namespace              = "traces.spanmetrics"
         resource_metrics_key_attributes = ["service.name", "telemetry.sdk.language", "telemetry.sdk.name"]
         output {
-          metrics = [otelcol.exporter.prometheus.default.input]
+          metrics = [otelcol.exporter.prometheus.spanmetrics.input]
         }
       }
-      otelcol.connector.servicegraph "default" {
-        dimensions = ["http.method", "http.target", "service.name"]
-        database_name_attributes = ["db.name"]
-        latency_histogram_buckets = ["2ms", "4ms", "6ms", "8ms", "10ms", "50ms", "100ms", "200ms", "400ms", "800ms", "1s", "1400ms", "2s", "5s", "10s", "15s"]
-        metrics_flush_interval = "15s"
-        output {
-          metrics = [otelcol.exporter.prometheus.default.input]
+      otelcol.exporter.prometheus "spanmetrics" {
+        forward_to = [prometheus.relabel.spanmetrics_tempo_compat.receiver]
+      }
+      // Grafana's Tempo service-graph / APM table queries Tempo metrics-generator names and labels
+      // (traces_spanmetrics_latency_*, label `service`). Keep the OTel names' data, expose Tempo's shape.
+      prometheus.relabel "spanmetrics_tempo_compat" {
+        forward_to = [prometheus.remote_write.mimir.receiver]
+        rule {
+          source_labels = ["__name__"]
+          regex         = "traces_spanmetrics_duration_seconds_(bucket|sum|count)"
+          target_label  = "__name__"
+          replacement   = "traces_spanmetrics_latency_${1}"
+        }
+        rule {
+          source_labels = ["service_name"]
+          regex         = "(.+)"
+          target_label  = "service"
+          replacement   = "${1}"
         }
       }
       otelcol.processor.batch "default" {
@@ -901,7 +867,8 @@ alloy:
         targets    = discovery.relabel.ebpf_targets.output
       }
       discovery.relabel "profiling_targets" {
-        targets = discovery.kubernetes.pods.targets
+        // Node-local pods only: each DaemonSet pod scrapes the pods on its own node exactly once.
+        targets = discovery.kubernetes.pods_node_local.targets
         // pyroscope.io/scrape (apps) OR profiles.grafana.com/* (e.g. Pyroscope Helm pods self-profiling).
         rule {
           source_labels = [
@@ -1487,7 +1454,9 @@ alloy:
 
   # -- Path to where Grafana Alloy stores data (for example, the Write-Ahead Log).
   # By default, data is lost between reboots.
-  storagePath: /tmp/alloy
+  # On a hostPath (controller.volumes.extra) so file/journal read positions and WAL survive pod
+  # re-creation; on emptyDir every rollout re-read /var/log/pods from the start (duplicate logs).
+  storagePath: /var/lib/alloy/data
 
   # -- Address to listen for traffic on. 0.0.0.0 exposes the UI to other
   # containers.
@@ -1509,11 +1478,11 @@ alloy:
   # -- Extra environment variables to pass to the Alloy container.
   extraEnv:
     - name: KUBE_CLUSTER_NAME
-      value: "MillenniumFalcon"
+      value: "millenniumfalcon" # must equal kube-prometheus-stack clusterName (Makefile CLUSTER_NAME)
     - name: ENVIRONMENT_NAME
       value: "Production"
     - name: AWS_REGION
-      value: "ap-southeast-1"
+      value: "us-east-2"
     - name: CLOUD_PROVIDER
       value: "aws"
     - name: PLATFORM_TYPE
@@ -1560,7 +1529,9 @@ alloy:
 
     # -- Extra volume mounts to add into the Grafana Alloy container. Does not
     # affect the watch container.
-    extra: []
+    extra:
+      - name: alloy-data
+        mountPath: /var/lib/alloy/data
       # - name: varlogjournal
       #   mountPath: /var/log/journal
       #   readOnly: true
@@ -1573,13 +1544,14 @@ alloy:
     runAsUser: 0
 
   # -- Resource requests and limits to apply to the Grafana Alloy container.
+  # Logs + OTLP traces/metrics + spanmetrics state + eBPF/pprof profiles in one process; 500Mi OOM'd
+  # under load. Requests sized for steady state, limit for bursts (tail sampling buffers, rollouts).
   resources:
     limits:
-      # cpu: "500m"
-      memory: "500Mi"
+      memory: "1536Mi"
     requests:
-      cpu: "100m"
-      memory: "256Mi"
+      cpu: "200m"
+      memory: "512Mi"
 
 
   # -- Set lifecycle hooks for the Grafana Alloy container.
@@ -1657,6 +1629,18 @@ configReloader:
   securityContext: {}
 
 controller:
+  # Run on every node, including the tainted observability node group.
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: observability
+      effect: NoSchedule
+  # Node-level collector: keep it from being evicted before application pods.
+  priorityClassName: system-node-critical
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
   # -- Type of controller to use for deploying Grafana Alloy in the cluster.
   # Must be one of 'daemonset', 'deployment', or 'statefulset'.
   hostPID: true
@@ -1674,7 +1658,11 @@ controller:
 
   volumes:
     # -- Extra volumes to add to the Grafana Alloy pod.
-    extra: []
+    extra:
+      - name: alloy-data
+        hostPath:
+          path: /var/lib/alloy/data
+          type: DirectoryOrCreate
       # - name: varlogjournal
       #   hostPath:
       #     path: /var/log/journal

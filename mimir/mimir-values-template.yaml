@@ -1,3 +1,13 @@
+# -- Placement on the dedicated observability node group (EKS node group "observability":
+#    label workload=observability, taint dedicated=observability:NoSchedule). Referenced by every component.
+observabilityNodeSelector: &observabilityNodeSelector
+  workload: observability
+observabilityTolerations: &observabilityTolerations
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule
+
 # Grafana Mimir (mimir-distributed) — production-oriented Helm values template.
 # Render with script.sh (envsubst): sets S3 buckets, IRSA role, and ${mimir_k8s_namespace}
 # (export mimir_k8s_namespace before envsubst if not using script.sh; default mimir).
@@ -36,6 +46,8 @@
 # https://github.com/grafana/mimir/blob/main/operations/mimir-mixin-compiled/dashboards/mimir-compactor-resources.json
 
 alertmanager:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   zoneAwareReplication:
     enabled: false
@@ -53,13 +65,15 @@ alertmanager:
   podDisruptionBudget:
     maxUnavailable: 1
   resources:
-    limits:
-      memory: 1.4Gi
     requests:
-      cpu: 500m
+      cpu: 50m
+      memory: 128Mi
+    limits:
       memory: 512Mi
 
 compactor:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   replicas: 1
   podDisruptionBudget:
@@ -73,23 +87,25 @@ compactor:
     whenDeleted: Retain
     whenScaled: Retain
   resources:
-    limits:
-      memory: 2Gi #2.8Gi
     requests:
-      cpu: 500m #1
-      memory: 500Mi #2Gi
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
 
 distributor:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   podDisruptionBudget:
     maxUnavailable: 1
   replicas: 2
   resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
     limits:
       memory: 2Gi
-    requests:
-      cpu: "1"
-      memory: 1Gi
 
 # https://grafana.com/docs/mimir/latest/manage/run-production-environment/planning-capacity/#ingester
 # For Ingester Estimated required CPU, memory, and disk space:
@@ -104,6 +120,8 @@ distributor:
 # Estimate the total number of series in memory across all ingesters using the following formula:
 # total number of in-memory series = <active series> * <replication factor>
 ingester:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   replicas: 3
   zoneAwareReplication:
@@ -122,11 +140,11 @@ ingester:
     whenDeleted: Retain
     whenScaled: Retain
   resources:
-    limits:
-      memory: 2Gi #4Gi
     requests:
-      cpu: "1"
-      memory: 2Gi
+      cpu: 500m
+      memory: 4Gi
+    limits:
+      memory: 8Gi
   topologySpreadConstraints: {}
   affinity:
     podAntiAffinity:
@@ -151,6 +169,14 @@ admin-cache:
   replicas: 1 #3
 
 chunks-cache:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 50m
+      memory: 640Mi
+    limits:
+      memory: 1Gi
   enabled: true
   replicas: 2
   batchSize: 4
@@ -166,16 +192,28 @@ chunks-cache:
   connectionLimit: 16384
 
 query_scheduler:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   replicas: 2
   podDisruptionBudget:
     maxUnavailable: 1
   resources:
     requests:
-      cpu: 100m
+      cpu: 50m
+      memory: 64Mi
+    limits:
       memory: 256Mi
 
 index-cache:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 50m
+      memory: 640Mi
+    limits:
+      memory: 1Gi
   enabled: true
   replicas: 2
   port: 11211
@@ -184,6 +222,14 @@ index-cache:
   connectionLimit: 16384
 
 metadata-cache:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 50m
+      memory: 640Mi
+    limits:
+      memory: 1Gi
   enabled: true
   replicas: 2
   port: 11211
@@ -192,6 +238,14 @@ metadata-cache:
   connectionLimit: 16384
 
 results-cache:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 50m
+      memory: 640Mi
+    limits:
+      memory: 1Gi
   enabled: true
   replicas: 2
   port: 11211
@@ -203,52 +257,62 @@ minio:
   enabled: false
 
 overrides_exporter:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   replicas: 1
   podDisruptionBudget:
     maxUnavailable: 1
   resources:
-    limits:
-      memory: 128Mi
     requests:
-      cpu: 100m
+      cpu: 50m
+      memory: 64Mi
+    limits:
       memory: 128Mi
 
 querier:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   replicas: 2
   resources:
-    limits:
-      memory: 2Gi
-    requests:
-      cpu: "1"
-      memory: 1Gi
-
-query_frontend:
-  enabled: true
-  replicas: 2
-  podDisruptionBudget:
-    maxUnavailable: 1
-  resources:
-    limits:
-      memory: 2.8Gi
-    requests:
-      cpu: 500m #2
-      memory: 500Mi #2Gi
-
-ruler:
-  enabled: true
-  replicas: 2
-  podDisruptionBudget:
-    maxUnavailable: 1
-  resources:
-    limits:
-      memory: 2Gi #5.7Gi
     requests:
       cpu: 500m
-      memory: 1Gi #4Gi
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+query_frontend:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  enabled: true
+  replicas: 2
+  podDisruptionBudget:
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+ruler:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  enabled: true
+  replicas: 2
+  podDisruptionBudget:
+    maxUnavailable: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
 
 store_gateway:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   enabled: true
   persistentVolume:
     size: 20Gi
@@ -256,11 +320,11 @@ store_gateway:
   podDisruptionBudget:
     maxUnavailable: 1
   resources:
-    limits:
-      memory: 1Gi #2Gi
     requests:
-      cpu: 500m
+      cpu: 250m
       memory: 1Gi
+    limits:
+      memory: 2Gi
   topologySpreadConstraints: {}
   affinity:
     podAntiAffinity:
@@ -286,12 +350,14 @@ store_gateway:
   #   topologyKey: 'kubernetes.io/hostname'
 
 nginx:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   replicas: 2
   resources:
-    limits:
-      memory: 731Mi
     requests:
-      cpu: 500m #1
+      cpu: 100m
+      memory: 128Mi
+    limits:
       memory: 512Mi
   image:
     registry: docker.io
@@ -629,6 +695,15 @@ mimir:
         heartbeat_timeout: 4m
       compaction_jobs_order: smallest-range-oldest-blocks-first
     distributor:
+      # HA de-duplication of the 2 Prometheus replicas (kube-prometheus-stack). Both replicas remote-write
+      # identical series that differ only by prometheus_replica; the tracker elects one replica per
+      # `cluster`, accepts only its samples and strips the replica label. KV = memberlist (same gossip
+      # ring as the other Mimir rings). Series without prometheus_replica (Alloy, Tempo, Loki ruler)
+      # pass through untouched.
+      ha_tracker:
+        enable_ha_tracker: true
+        kvstore:
+          store: memberlist
       max_recv_msg_size: 104857600
       max_otlp_request_size: 104857600
       max_influx_request_size: 104857600
@@ -761,6 +836,11 @@ mimir:
     # By default, metrics that are stored in the object storage are never deleted, and the storage utilization will increase over time.
     # You can configure the object storage retention to automatically delete all metrics data older than the configured period.
     limits:
+      # HA tracker (distributor.ha_tracker): must match kube-prometheus-stack externalLabels.cluster
+      # and prometheusSpec.replicaExternalLabelName.
+      accept_ha_samples: true
+      ha_cluster_label: cluster
+      ha_replica_label: prometheus_replica
       # Delete from storage metrics data older than 1 year from object storage.
       compactor_blocks_retention_period: 1y
       compactor_partial_block_deletion_delay: 1d
@@ -782,7 +862,7 @@ mimir:
       max_label_names_per_series: 30
       max_label_names_per_info_series: 80
       max_metadata_length: 1024
-      max_global_series_per_user: 2500000
+      max_global_series_per_user: 1500000 # RF=3 on 3 ingesters → each holds every series (~4-5 KiB each); fits the 8Gi ingester limit. Raise together.
       max_native_histogram_buckets: 0
       max_exemplars_per_series_per_request: 0
       reduce_native_histogram_over_max_buckets: true
@@ -871,7 +951,21 @@ metaMonitoring:
     labels:
       release: kube-prometheus-stack # label which prometheus is looking for. whether monitor this serviceMonitor or not.
 
+# Memcached exporter sidecar on every cache pod (chart default request is 500m CPU each).
+memcachedExporter:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
 
-
-
-
+rollout_operator:
+  nodeSelector: *observabilityNodeSelector
+  tolerations: *observabilityTolerations
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

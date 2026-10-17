@@ -177,6 +177,36 @@ inputs = {
       audit_ami = false
       bottlerocket_ami = false
     }
+    # Dedicated LGTM node group (Loki / Mimir / Tempo / Pyroscope / Prometheus / Grafana).
+    # Tainted so only observability workloads (which carry the matching toleration + nodeSelector)
+    # schedule here; DaemonSet agents (Alloy, Beyla, node-exporter) tolerate it and run everywhere.
+    # Sizing: the stack requests ~18 vCPU / ~53 GiB (rendered charts). 4 × m6i.2xlarge ≈ 27 vCPU /
+    # 115 GiB schedulable after DaemonSets → ~66% CPU requested, and the stack still fits on 3 nodes
+    # after losing one. Mimir ingesters / store-gateways need ≥3 nodes (required per-host anti-affinity).
+    # No cluster-autoscaler yet: scale by editing desired/min here.
+    "observability" = {
+      subnets          = local.common_vars["private_subnets"]
+      instance_type    = ["m6i.2xlarge"]
+      desired_capacity = 4
+      max_capacity     = 6
+      min_capacity     = 4
+      capacity_type    = "ON_DEMAND"
+      tags             = merge(local.common_tags, local.worker_tags)
+      kubeargs         = "" # required by the module to render user data; labels/taints below go to NodeConfig
+      volume_size      = 50
+      audit_ami        = false
+      bottlerocket_ami = false
+      labels = {
+        workload = "observability"
+      }
+      taints = [
+        {
+          key    = "dedicated"
+          value  = "observability"
+          effect = "NoSchedule"
+        }
+      ]
+    }
   }
 #  custom_policy = <<EOF
 #{

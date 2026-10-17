@@ -8,6 +8,7 @@
 NAMESPACE_loki  = loki
 NAMESPACE_tempo = tempo
 NAMESPACE_alloy = alloy-logs
+NAMESPACE_alloy-events = alloy-logs
 NAMESPACE_mimir = mimir
 NAMESPACE_kube-prometheus-stack = monitoring
 NAMESPACE_pyroscope = pyroscope
@@ -20,6 +21,7 @@ NAMESPACE_beyla = beyla
 CHART_loki  = grafana/loki
 CHART_tempo = grafana/tempo-distributed
 CHART_alloy = grafana/alloy
+CHART_alloy-events = grafana/alloy
 CHART_mimir = grafana/mimir-distributed
 CHART_kps   = ./kube-prometheus-stack
 CHART_pyroscope = grafana/pyroscope
@@ -32,6 +34,7 @@ CHART_beyla = grafana/beyla
 VERSION_loki  = 6.30.1
 VERSION_tempo = 1.42.2
 VERSION_alloy = 1.2.1
+VERSION_alloy-events = $(VERSION_alloy)
 VERSION_mimir = 5.7.0
 VERSION_pyroscope = 1.14.0
 VERSION_blackbox = 11.0.0
@@ -44,6 +47,7 @@ VERSION_beyla = 1.16.8
 VALUES_loki  = ./loki/loki-override-values.rendered.yaml
 VALUES_tempo = ./tempo/tempo-override-values.rendered.yaml
 VALUES_alloy = ./alloy/alloy-override-values.yaml
+VALUES_alloy-events = ./alloy/alloy-events-values.yaml
 VALUES_mimir = ./mimir/mimir-override-values.rendered.yaml
 VALUES_kps   = ./kube-prometheus-stack/prometheus-values.yaml
 VALUES_kps_override = ./kube-prometheus-stack/prometheus-override-values.rendered.yaml
@@ -194,6 +198,14 @@ install-alloy: apply-alloy-manifests
 		--values $(VALUES_alloy) \
 		--debug
 
+# Single-replica Kubernetes events collector (events must not be collected by the DaemonSet: N× duplicates).
+install-alloy-events: apply-alloy-manifests
+	helm upgrade --install grafana-alloy-events $(CHART_alloy-events) \
+		--version $(VERSION_alloy-events) \
+		-n $(NAMESPACE_alloy-events) \
+		--values $(VALUES_alloy-events) \
+		--debug
+
 install-mimir:
 	helm upgrade --install mimir $(CHART_mimir) \
 		--version $(VERSION_mimir) \
@@ -264,6 +276,9 @@ uninstall-kube-prometheus-stack:
 uninstall-alloy:
 	helm uninstall grafana-alloy -n $(NAMESPACE_alloy) || true
 
+uninstall-alloy-events:
+	helm uninstall grafana-alloy-events -n $(NAMESPACE_alloy-events) || true
+
 uninstall-blackbox:
 	helm uninstall prometheus-blackbox-exporter -n $(NAMESPACE_blackbox) || true
 
@@ -290,11 +305,15 @@ uninstall-cleanup:
 	-kubectl delete externalsecret mimir-basic-auth -n $(NAMESPACE_mimir) || true
 	-kubectl delete externalsecret mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) || true
 	-kubectl delete externalsecret alloy-remote-credentials -n $(NAMESPACE_alloy) || true
+	-kubectl delete externalsecret tempo-mimir-remote-write -n $(NAMESPACE_tempo) || true
+	-kubectl delete externalsecret loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) || true
 	-kubectl delete secret loki-basic-auth -n $(NAMESPACE_loki) || true
 	-kubectl delete secret canary-basic-auth -n $(NAMESPACE_loki) || true
 	-kubectl delete secret mimir-basic-auth -n $(NAMESPACE_mimir) || true
 	-kubectl delete secret mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) || true
 	-kubectl delete secret alloy-remote-credentials -n $(NAMESPACE_alloy) || true
+	-kubectl delete secret tempo-mimir-remote-write -n $(NAMESPACE_tempo) || true
+	-kubectl delete secret loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) || true
 
 	@echo "🗑 Deleting ConfigMaps..."
 	-kubectl delete configmap alloy-config -n $(NAMESPACE_alloy) || true
@@ -318,7 +337,7 @@ uninstall-cleanup:
 	-kubectl delete namespace $(NAMESPACE_beyla) --force || true
 	@echo "✅ Cleanup done."
 
-uninstall-all: uninstall uninstall-alloy uninstall-pyroscope uninstall-blackbox uninstall-beyla uninstall-cleanup
+uninstall-all: uninstall uninstall-alloy uninstall-alloy-events uninstall-pyroscope uninstall-blackbox uninstall-beyla uninstall-cleanup
 
 # -------------------------------------
 # Status & Logs
@@ -334,10 +353,10 @@ template-debug-kube-prometheus-stack:
 template-debug-%:
 	helm template $* $(CHART_$*) -n $(NAMESPACE_$*) --values $(VALUES_$*) --debug
 
-install: init install-kube-prometheus-stack install-mimir install-loki install-tempo install-alloy install-pyroscope install-blackbox install-beyla
-status: status-loki status-tempo status-alloy status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox status-beyla
+install: init install-kube-prometheus-stack install-mimir install-loki install-tempo install-alloy install-alloy-events install-pyroscope install-blackbox install-beyla
+status: status-loki status-tempo status-alloy status-alloy-events status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox status-beyla
 logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox logs-beyla
-template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox template-debug-beyla
+template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-alloy-events template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox template-debug-beyla
 
 # =====================================================================
 # ==================== External Secrets Operator ======================
@@ -433,7 +452,7 @@ eso-apply:
 	@$(MAKE) eso-wait-crds
 	@$(MAKE) eso-wait-webhook
 	@echo "👉 Ensuring namespaces for ExternalSecrets..."
-	@for ns in $(NAMESPACE_loki) $(NAMESPACE_mimir) $(NAMESPACE_alloy) $(NAMESPACE_kube-prometheus-stack); do \
+	@for ns in $(NAMESPACE_loki) $(NAMESPACE_mimir) $(NAMESPACE_alloy) $(NAMESPACE_kube-prometheus-stack) $(NAMESPACE_tempo); do \
 		kubectl get namespace $$ns >/dev/null 2>&1 || kubectl create namespace $$ns; \
 	done
 	@echo "👉 Applying ClusterSecretStore (region=$(REGION))"
@@ -445,6 +464,8 @@ eso-apply:
 	@kubectl apply -f ./external-secrets/externalsecret-alloy-remote-credentials.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-mimir-remote-write.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-grafana-auth.yaml
+	@kubectl apply -f ./external-secrets/externalsecret-tempo-mimir-remote-write.yaml
+	@kubectl apply -f ./external-secrets/externalsecret-loki-ruler-mimir-remote-write.yaml
 	@$(MAKE) eso-wait
 
 eso-wait:
@@ -455,6 +476,8 @@ eso-wait:
 	@kubectl wait --for=condition=Ready externalsecret/alloy-remote-credentials -n $(NAMESPACE_alloy) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/grafana-auth-secrets -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
+	@kubectl wait --for=condition=Ready externalsecret/tempo-mimir-remote-write -n $(NAMESPACE_tempo) --timeout=180s
+	@kubectl wait --for=condition=Ready externalsecret/loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) --timeout=180s
 	@echo "✅ ExternalSecrets synced"
 	@if kubectl get deploy kube-prometheus-stack-grafana -n $(NAMESPACE_kube-prometheus-stack) >/dev/null 2>&1; then \
 	  echo "♻️  Restarting Grafana to reload datasource credentials..."; \

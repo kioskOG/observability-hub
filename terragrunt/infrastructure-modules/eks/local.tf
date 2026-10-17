@@ -325,4 +325,18 @@ locals {
   security_group        = [for i, k in var.node_groups : i if lookup(k, "security_group", null) != null]
   node_group_userdata   = [for i, j in var.node_groups : i if lookup(j, "kubeargs", null) != null]
   bottlerocket_userdata = [for i, j in var.node_groups : i if lookup(j, "bootstrap_extra_args", null) != null]
+
+  # Optional per-node-group Kubernetes labels / taints.
+  # Custom-AMI launch templates bypass EKS label/taint injection, so they are also passed to the
+  # kubelet through NodeConfig. Node groups without labels/taints render an empty string, which keeps
+  # their user data (and launch template version) unchanged.
+  node_group_labels = { for k, v in var.node_groups : k => try(v.labels, {}) }
+  node_group_taints = { for k, v in var.node_groups : k => try(v.taints, []) }
+  node_group_kubelet_flags = {
+    for k, v in var.node_groups : k => join("", concat(
+      length(local.node_group_labels[k]) + length(local.node_group_taints[k]) > 0 ? ["    flags:\n"] : [],
+      length(local.node_group_labels[k]) > 0 ? [format("    - --node-labels=%s\n", join(",", [for lk, lv in local.node_group_labels[k] : "${lk}=${lv}"]))] : [],
+      length(local.node_group_taints[k]) > 0 ? [format("    - --register-with-taints=%s\n", join(",", [for t in local.node_group_taints[k] : "${t.key}=${t.value}:${t.effect}"]))] : [],
+    ))
+  }
 }

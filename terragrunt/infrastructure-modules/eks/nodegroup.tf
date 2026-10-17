@@ -16,6 +16,16 @@ resource "aws_eks_node_group" "node_groups" {
   instance_types         = each.value.instance_type
   capacity_type          = each.value.capacity_type
   force_update_version   = var.force_update_version
+  labels                 = local.node_group_labels[each.key]
+
+  dynamic "taint" {
+    for_each = local.node_group_taints[each.key]
+    content {
+      key    = taint.value.key
+      value  = taint.value.value
+      effect = { NoSchedule = "NO_SCHEDULE", PreferNoSchedule = "PREFER_NO_SCHEDULE", NoExecute = "NO_EXECUTE" }[taint.value.effect]
+    }
+  }
 
   launch_template {
     id      = aws_launch_template.launch_template[each.key].id
@@ -279,6 +289,7 @@ data "template_file" "userdata" {
     API_SERVER_URL       = aws_eks_cluster.eks_cluster.endpoint
     KUBELET_ARGS         = var.node_groups[each.key].kubeargs
     CLUSTER_SERVICE_CIDR = var.cluster_service_cidr
+    KUBELET_FLAGS        = local.node_group_kubelet_flags[each.key]
   }
 }
 

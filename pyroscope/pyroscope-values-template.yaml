@@ -1,7 +1,20 @@
+# -- Placement on the dedicated observability node group (EKS node group "observability":
+#    label workload=observability, taint dedicated=observability:NoSchedule).
+observabilityNodeSelector: &observabilityNodeSelector
+  workload: observability
+observabilityTolerations: &observabilityTolerations
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule
+
 alloy:
   enabled: false
 
 pyroscope:
+  tolerations: *observabilityTolerations
+  # Applied to every Pyroscope component (chart merges these into each entry of `components`).
+  nodeSelector: *observabilityNodeSelector
   config: |
     storage:
       backend: s3
@@ -178,7 +191,7 @@ pyroscope:
           cpu: "1"
     ingester:
       kind: StatefulSet
-      replicaCount: 2 #3
+      replicaCount: 3 # = ingester ring replication_factor (3); 2 could not keep write quorum through one loss
       terminationGracePeriodSeconds: 600
       resources:
         limits:
