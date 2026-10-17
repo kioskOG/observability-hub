@@ -6,6 +6,16 @@ terraform {
   source = "../../../../..//infrastructure-modules/eks/"
 }
 
+# Subnets of the third AZ (us-east-2c) come from the VPC stack's outputs. Apply ../vpc first:
+# the mock is only for `terragrunt validate`, never plan/apply.
+dependency "vpc" {
+  config_path = "../vpc"
+  mock_outputs = {
+    private_subnet_ids_by_az = { "us-east-2c" = ["subnet-00000000000000000"] }
+  }
+  mock_outputs_allowed_terraform_commands = ["validate"]
+}
+
 locals {
   common_vars = yamldecode(file("${get_terragrunt_dir()}/../common.yaml"))
   common_tags = {
@@ -184,6 +194,9 @@ inputs = {
     # 115 GiB schedulable after DaemonSets → ~66% CPU requested, and the stack still fits on 3 nodes
     # after losing one. Mimir ingesters / store-gateways need ≥3 nodes (required per-host anti-affinity).
     # No cluster-autoscaler yet: scale by editing desired/min here.
+    # us-east-2a / 2b. subnet_ids of a managed node group are immutable (changing them replaces every
+    # node), and the stack's EBS volumes are pinned to a/b, so this group keeps its subnets; the third
+    # AZ gets its own group below. One group per AZ is also what an autoscaler needs for EBS workloads.
     "observability" = {
       subnets          = local.common_vars["private_subnets"]
       instance_type    = ["m6i.2xlarge"]
@@ -193,6 +206,30 @@ inputs = {
       capacity_type    = "ON_DEMAND"
       tags             = merge(local.common_tags, local.worker_tags)
       kubeargs         = "" # required by the module to render user data; labels/taints below go to NodeConfig
+      volume_size      = 50
+      audit_ami        = false
+      bottlerocket_ami = false
+      labels = {
+        workload = "observability"
+      }
+      taints = [
+        {
+          key    = "dedicated"
+          value  = "observability"
+          effect = "NoSchedule"
+        }
+      ]
+    }
+    # Third AZ for the observability node group: 2 nodes in us-east-2c → 2 per AZ (6 total).
+    "observability-c" = {
+      subnets          = dependency.vpc.outputs.private_subnet_ids_by_az["us-east-2c"]
+      instance_type    = ["m6i.2xlarge"]
+      desired_capacity = 2
+      max_capacity     = 3
+      min_capacity     = 2
+      capacity_type    = "ON_DEMAND"
+      tags             = merge(local.common_tags, local.worker_tags)
+      kubeargs         = ""
       volume_size      = 50
       audit_ami        = false
       bottlerocket_ami = false

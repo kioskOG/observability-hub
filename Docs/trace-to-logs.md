@@ -88,7 +88,7 @@ open faro/faro-web-sdk.example.html   # POSTs to http://localhost:12347/collect
 ### Step C — Confirm data
 
 1. Grafana Explore → **Tempo** → Search (last 15m). Open a trace.
-2. Explore → **Loki (traces / spanlogs)** (tenant `traces`):
+2. Explore → **Loki** (environment tenant):
 
 ```logql
 {job="spanlogs"}
@@ -131,13 +131,13 @@ With 10% keep rate you need **many** requests (dozens+) or you may see no traces
                     │       │                              │
                     │       ├─► sampler (off|head|tail)    │
                     │       │       ├─► batch ──► Tempo    │
-                    │       │       └─► spanlogs ──► Loki  │  tenant = traces
+                    │       │       └─► spanlogs ──► Loki  │  tenant = <env>
                     │       │                              │  job = spanlogs
                     │       ├─► spanmetrics ──► Mimir      │  (100%, unsampled)
                     │       └─► servicegraph ──► Mimir     │  (100%, unsampled)
                     │                                      │
-                    │  pod logs ──► Loki (tenant=namespace)│
-                    │  Faro events ──► Loki (frontend)     │
+                    │  pod logs ──► Loki (source=pod)      │
+                    │  Faro events ──► Loki (source=faro)  │
                     └──────────────────────────────────────┘
 ```
 
@@ -146,8 +146,8 @@ With 10% keep rate you need **many** requests (dozens+) or you may see no traces
 | | |
 |--|--|
 | **When** | Spans reach Alloy and pass sampling |
-| **Where** | Loki tenant **`traces`**, label **`job=spanlogs`** |
-| **Grafana DS** | **Loki (traces / spanlogs)** (`uid: loki-traces`) |
+| **Where** | Environment tenant, label **`job=spanlogs`** |
+| **Grafana DS** | **Loki** (`uid: loki`) |
 | **Use** | Tempo → **Logs for this span** |
 | **Not for** | Business / app debugging (use Path B) |
 
@@ -156,15 +156,15 @@ With 10% keep rate you need **many** requests (dozens+) or you may see no traces
 | | |
 |--|--|
 | **When** | Apps log `trace_id` / `span_id` (OTel log bridge or manual fields) |
-| **Where** | Loki tenant = **Kubernetes namespace** |
-| **Grafana DS** | e.g. **Loki (monitoring)** or a DS whose `X-Scope-OrgID` matches that namespace |
+| **Where** | Environment tenant, `{source="pod", namespace="<ns>"}` |
+| **Grafana DS** | **Loki** (`uid: loki`) |
 | **Use** | Logs → **Tempo** derived field |
 
 ### Path C — Faro events
 
 | | |
 |--|--|
-| **Where** | Loki tenant **`frontend`**, DS **Loki (frontend / Faro)** |
+| **Where** | Environment tenant, `{source="faro"}`, DS **Loki** |
 | **Traces** | Same sampler as OTLP → Tempo + spanlogs |
 
 ---
@@ -173,12 +173,12 @@ With 10% keep rate you need **many** requests (dozens+) or you may see no traces
 
 | Concern | File | What to change |
 |---------|------|----------------|
-| Sampling + spanlogs + Faro + OTLP pipeline | `alloy/alloy-override-values.yaml` | `traceSampling.*`, River under `alloy.configMap.content` |
-| Tempo → Logs / Loki → Tempo datasources | `kube-prometheus-stack/prometheus-values.yaml` | `grafana.additionalDataSources` (`Tempo`, `loki-traces`, …) |
+| Sampling + spanlogs + Faro + OTLP pipeline | `alloy/alloy-override-values.yaml`, `alloy/config/daemonset.alloy` | `traceSampling.*` in the values; pipeline in the `.alloy` file |
+| Tempo → Logs / Loki → Tempo datasources | `kube-prometheus-stack/prometheus-values.yaml` | `grafana.additionalDataSources` (`Tempo`, `loki`, `loki-all`) |
 | Beyla → Alloy OTLP | `beyla/beyla-values.yaml` | Target Alloy endpoint, exclusions |
 | Faro demo page | `faro/faro-web-sdk.example.html` | `FARO_URL` |
 | Rider demo app | `pyroscope/pyroscope-rideshare-go/rider-go.yaml` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| Loki gateway / tenants | `loki/loki-override-values.yaml` | Auth, default OrgID map |
+| Loki gateway / tenants | `loki/loki-values-template.yaml` | Auth, user → tenant map (`httpSnippet`, `serverSnippet`) |
 
 After Alloy or Grafana values changes:
 
@@ -266,11 +266,9 @@ Legacy `tid=` / `svc=` are still accepted by the Alloy regex stages.
 
 | Name | uid | `X-Scope-OrgID` | Role |
 |------|-----|-----------------|------|
-| Tempo | `tempo` | — | Traces; **Logs for this span** → `loki-traces` |
-| Loki (traces / spanlogs) | `loki-traces` | `traces` | Spanlogs; Tempo→Logs target |
-| Loki | `loki` | `default` | App logs in `default` |
-| Loki (monitoring) | `loki-monitoring` | `monitoring` | App logs in `monitoring` |
-| Loki (frontend / Faro) | `loki-frontend` | `frontend` | Faro events |
+| Tempo | `tempo` | — | Traces; **Logs for this span** → `loki` |
+| Loki | `loki` | `$__env{TENANT}` (`prod` / `stage` / `dev`) | All logs of this environment; Tempo→Logs target |
+| Loki (all environments) | `loki-all` | `prod\|stage\|dev` | Cross-environment search |
 
 Tempo custom query (production):
 
@@ -280,7 +278,7 @@ Tempo custom query (production):
 
 Time shift around the span: **±5m** (`tracesToLogsV2` in `prometheus-values.yaml`).
 
-If Explore shows “no data”, the Loki datasource’s **OrgID almost always mismatches** the tenant Alloy used.
+If Explore shows “no data”, Grafana `TENANT` almost always differs from the Alloy `ENVIRONMENT_NAME` that wrote the logs.
 
 ---
 
@@ -340,7 +338,7 @@ Before opening a PR that touches Trace ↔ Logs:
 | Accurate correlation | Shared 32-hex `trace_id` in Tempo and Loki metadata / body |
 | Low query latency | Selectors on `job` / `service_name`; IDs in structured metadata |
 | Safe cardinality | Never index `trace_id` / `span_id` / pod as stream labels |
-| Multi-tenant isolation | Spanlogs → `traces`; apps → namespace; Faro → `frontend` |
+| Multi-tenant isolation | One tenant per environment, enforced by the gateway; streams split by `source` / `job` labels |
 | Bidirectional UX | `tracesToLogsV2` + Loki `derivedFields` |
 | Sample once | Head/tail before Tempo **and** spanlogs fan-out |
 

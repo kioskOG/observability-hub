@@ -1,0 +1,134 @@
+// Grafana Alloy config for the grafana-alloy-events release (alloy/alloy-events-values.yaml).
+// Passed with `helm --set-file alloy.configMap.content=<this file>` (see the Makefile) and rendered
+// through Helm tpl, so the template actions gated on .Values (kafka.enabled) are evaluated first.
+// Alloy's own logs → Loki source="alloy" (same as the DaemonSet).
+loki.process "alloy_internal_logs" {
+  stage.static_labels {
+    values = { source = "alloy" }
+  }
+  forward_to = [loki.write.loki.receiver]
+}
+logging {
+  level    = "info"
+  format   = "json"
+  write_to = [loki.process.alloy_internal_logs.receiver]
+}
+
+// Kubernetes cluster events → Loki source="k8s-events", labelled with the involved object's namespace
+// (k8s_namespace_name; "cluster" for cluster-scoped objects). Tenant = environment, set on loki.write.
+loki.source.kubernetes_events "cluster_events" {
+  job_name   = "integrations/kubernetes/eventhandler"
+  log_format = "json"
+  forward_to = [loki.process.cluster_events.receiver]
+}
+loki.process "cluster_events" {
+  stage.static_labels {
+    values = {
+      source      = "k8s-events",
+      cluster     = sys.env("KUBE_CLUSTER_NAME"),
+      environment = sys.env("ENVIRONMENT_NAME"),
+      region      = sys.env("AWS_REGION"),
+    }
+  }
+  stage.replace {
+    expression = "(\"type\":\"Normal\")"
+    replace = "\"type\":\"Normal\",\"level\":\"info\""
+  }
+  stage.replace {
+    expression = "(\"type\":\"Warning\")"
+    replace = "\"type\":\"Warning\",\"level\":\"warning\""
+  }
+  stage.json {
+    expressions = {
+      k8s_resource_kind = "kind",
+      k8s_resource_name = "name",
+      k8s_event_reason  = "reason",
+      k8s_event_message = "message",
+      k8s_event_type    = "type",
+      k8s_namespace_name = "namespace",
+    }
+  }
+  stage.replace {
+    source     = "k8s_namespace_name"
+    expression = "^$"
+    replace    = "cluster"
+  }
+  stage.labels {
+    values = {
+      k8s_namespace_name = "k8s_namespace_name",
+      k8s_resource_kind  = "k8s_resource_kind",
+      k8s_event_reason   = "k8s_event_reason",
+      k8s_event_type     = "k8s_event_type",
+      k8s_resource_name  = "k8s_resource_name",
+    }
+  }
+  stage.structured_metadata {
+    values = {
+      k8s_resource_name = "k8s_resource_name",
+      k8s_event_message = "k8s_event_message",
+    }
+  }
+  stage.label_keep {
+    values = ["source", "cluster", "environment", "region", "job", "k8s_namespace_name", "k8s_resource_kind", "k8s_event_reason", "k8s_event_type"]
+  }
+  forward_to = [loki.write.loki.receiver{{- if .Values.kafka.enabled }}, otelcol.receiver.loki.kafka_bridge.receiver{{- end }}]
+}
+{{- if .Values.kafka.enabled }}
+otelcol.exporter.kafka "to_kafka" {
+  protocol_version = "2.0.0"
+  brokers   = string.split(sys.env("KAFKA_BROKERS"), ",")
+  client_id = coalesce(sys.env("KAFKA_CLIENT_ID"), "grafana-alloy-events")
+  timeout = "30s"
+  logs {
+    topic    = sys.env("KAFKA_TOPIC")
+    encoding = "otlp_proto"
+  }
+  producer {
+    max_message_bytes = 1048576
+    compression       = "snappy"
+  }
+  sending_queue {
+    block_on_overflow = true
+    queue_size        = 2000
+  }
+  retry_on_failure {
+    enabled          = true
+    initial_interval = "2s"
+    max_interval     = "60s"
+    max_elapsed_time = "0s"
+    multiplier       = 1.8
+  }
+}
+otelcol.processor.batch "logs_to_kafka" {
+  timeout             = "3s"
+  send_batch_size     = 200
+  send_batch_max_size = 200
+  output {
+    logs = [otelcol.exporter.kafka.to_kafka.input]
+  }
+}
+otelcol.receiver.loki "kafka_bridge" {
+  output {
+    logs = [otelcol.processor.batch.logs_to_kafka.input]
+  }
+}
+{{- end }}
+
+loki.write "loki" {
+  endpoint {
+    url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+    // Must equal the tenant the gateway enforces for LOKI_GATEWAY_USERNAME (loki-writer-<env>), or it returns 403.
+    tenant_id = sys.env("ENVIRONMENT_NAME")
+    basic_auth {
+      username = sys.env("LOKI_GATEWAY_USERNAME")
+      password = sys.env("LOKI_GATEWAY_PASSWORD")
+    }
+  }
+  external_labels = {
+    cluster     = sys.env("KUBE_CLUSTER_NAME"),
+    environment = sys.env("ENVIRONMENT_NAME"),
+    region      = sys.env("AWS_REGION"),
+    cloud       = sys.env("CLOUD_PROVIDER"),
+    platform    = sys.env("PLATFORM_TYPE"),
+  }
+}

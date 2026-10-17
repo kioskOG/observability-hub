@@ -80,10 +80,47 @@ make pf-grafana   # then in Grafana → Explore (Mimir):
 - **Grafana** runs 2 replicas on SQLite with a PVC per pod: users/sessions/UI-made dashboards differ
   per replica. Move to RDS Postgres (or run 1 replica) — deliberately not changed here because
   scaling down would orphan the second pod's database.
-- **2 AZs only** (VPC private subnets are in us-east-2a/b). Zone-aware replication needs a third.
+- **Zone-aware replication** is still off. A third AZ now exists (see below); enabling it is the next step.
 - **No cluster-autoscaler / Karpenter** on the observability group: scale via `desired_capacity`.
 - **StorageClass `gp2-standard` parameters are immutable**: the current `default-storage-class.yaml`
   (gp3, encrypted) is rejected by `kubectl apply` on clusters that already have the old gp2 class.
   Delete and re-create the StorageClass object first (existing PVs are not affected).
 - **Tail sampling mode** keeps a biased subset, so no `sampling.ratio` is stamped and Tempo
   service-graph rates are not scaled in that mode (head mode is the default).
+
+## Third availability zone (us-east-2c)
+
+Adds `us-east-2c` to the VPC and the observability nodes, giving 2 nodes per AZ (6 total), with a NAT gateway per AZ.
+
+| Stack | Change |
+|---|---|
+| `vpc` | New public subnet `10.36.128.0/20` and private subnet `10.36.144.0/20` in us-east-2c. Existing subnets are untouched: the AZ list is written per subnet, so no subnet changes AZ. `nat_gateway_per_az = true` adds NAT gateways (+ EIPs) in b and c and a private route table per AZ; the original NAT gateway stays in a. |
+| `vpc` module | `nat_gateway_per_az` (default `false` = previous single-NAT behaviour), outputs `private_subnet_ids_by_az` and `nat_gateway_ids`. `tests/az.tftest.hcl` checks the subnet → AZ mapping and routing with a mock provider (`terraform test`). |
+| `eks` | New managed node group `observability-c` (2 × m6i.2xlarge, same label and taint) in the us-east-2c subnet, read from the VPC stack's outputs (`dependency "vpc"`). The existing `observability` group and the control-plane subnets are not changed: node-group `subnet_ids` are immutable, and changing them would replace every node. |
+
+### Rollout
+
+1. **VPC:**
+   ```bash
+   cd terragrunt/infrastructure-live/accounts/mlops/us-east-2/vpc
+   terragrunt plan    # expect: + 2 subnets, + 2 NAT gateways / EIPs, + 2 route tables, + 1 association;
+                      #         ~ route-table changes on the b subnets' associations. NO subnet replaced.
+   terragrunt apply
+   ```
+   The b subnets switch from the a NAT gateway to the b one with an in-place association update; open connections through NAT may reset once.
+2. **EKS:**
+   ```bash
+   cd ../eks
+   terragrunt plan    # expect: + node group observability-c (+ launch template); nothing else
+   terragrunt apply
+   kubectl get nodes -l workload=observability -L topology.kubernetes.io/zone   # 2 per zone
+   ```
+3. **Nothing moves by itself.** Existing pods and their EBS volumes stay in a/b. New PVCs (`WaitForFirstConsumer`) and DaemonSets will also use c.
+
+### Next: zone-aware replication
+
+With three zones, Loki, Mimir and Tempo can spread replicas so that an AZ outage loses at most one copy (`zoneAwareReplication` in each chart; `topology.kubernetes.io/zone` as the zone label). The charts re-create the ingester / store-gateway StatefulSets under per-zone names, so plan it as its own migration: flush ingesters first, follow each chart's migration guide, and roll one component at a time.
+
+### Cost
+
+Two more NAT gateways and EIPs (hourly charge + per-GB processing each) and 2 more m6i.2xlarge. Set `nat_gateway_per_az = false` to keep a single NAT gateway (in a): cheaper, but egress for every AZ then depends on us-east-2a.

@@ -1,85 +1,60 @@
-To test the complete end-to-end flow from scratch—starting with a raw AWS account and ending with a successful SSO login into Grafana—you should execute the following sequence of commands.
+# How to deploy (end to end, with Keycloak SSO)
 
-This sequence follows the repository's strict separation of concerns: **Cloud Infrastructure** ➔ **Identity Infrastructure** ➔ **Secret Sync** ➔ **Helm Application Deployment**.
+The complete, maintained install procedure is in the README: [Complete installation (from scratch)](../README.md#complete-installation-from-scratch). This page is the short version of the same sequence, ending with an SSO login into Grafana.
 
-### 1. Base AWS Infrastructure (VPC & EKS)
-First, establish the network and compute layer.
+The layers, in order: **Cloud infrastructure** ➔ **Identity** ➔ **Storage + IRSA** ➔ **Secret sync** ➔ **Helm deployment**.
+
+## 0. Target
+
 ```bash
-# 1. Provision the VPC
-cd terragrunt/infrastructure-live/accounts/mlops/us-east-2/vpc
-terragrunt apply
-
-# 2. Provision the EKS Cluster
-cd ../eks
-terragrunt apply
-
-# 3. Authenticate kubectl against the new cluster
-aws eks update-kubeconfig --region us-east-2 --name <your-cluster-name>
+export CLUSTER_NAME=millenniumfalcon AWS_REGION=us-east-2 ENVIRONMENT=dev   # prod | stage | dev
 ```
 
-```
-export AWS_REGION="us-east-2"                  
-export KUBECONFIG=$HOME/.kube/millenniumfalcon
-```
+Make sure `ENVIRONMENT_NAME` (both Alloy values files) and `grafana.env.TENANT` (`prometheus-values.yaml`) are set to the same `ENVIRONMENT`.
 
-### 2. IAM & Storage (IRSA & S3)
-Provision the S3 buckets for Loki/Mimir/Tempo and the IAM roles required by the pods.
+## 1. VPC and EKS
+
 ```bash
-# 1. Provision IAM roles for IRSA
-cd ../../global/iam/role
-terragrunt apply
-
-# 2. Provision S3 buckets 
-cd ../../us-east-2/s3
-terragrunt run-all apply
+cd terragrunt/infrastructure-live/accounts/mlops/us-east-2/vpc && terragrunt apply
+cd ../eks && terragrunt apply
+cd -
+aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER_NAME"
 ```
 
-### 3. Identity & Secrets Publication (The new SSO Integration)
-Now, orchestrate the identity layer and publish the generated credentials.
+## 2. Keycloak client and Grafana OAuth secret
+
 ```bash
-# 1. Provision the Grafana OIDC Client in Keycloak
-cd ../keycloak/grafana
-terragrunt apply
-
-# 2. Publish the generated OAuth client_secret to AWS Secrets Manager
-cd ../../secrets/grafana-auth
-terragrunt apply
+cd terragrunt/infrastructure-live/accounts/mlops/us-east-2/keycloak/grafana && terragrunt apply
+cd ../../secrets/grafana-auth && terragrunt apply
+cd -
 ```
 
-### 4. Kubernetes Secret Synchronization
-Switch back to the repository root to manage Kubernetes-level secret synchronization using the `Makefile`.
+## 3. S3 buckets, IRSA roles, rendered values
+
 ```bash
-# Return to the repository root
-cd ../../../../../../..
-
-# 1. Seed standard Basic Auth passwords (Loki/Mimir) into AWS Secrets Manager
-make eso-seed
-
-# 2. Install External Secrets Operator (if not already installed on the cluster)
-make external-secrets
-
-# 3. Create ClusterSecretStore and ExternalSecrets (Syncs the Keycloak Secret to K8s)
-make eso-apply
+make aws-apply    # S3 → global/iam/role → render-helm-values (needs the Keycloak outputs from step 2)
 ```
 
-### 5. Helm Rendering & Deployment
-Finally, deploy the Observability applications, dynamically injecting the Keycloak OIDC endpoints and client ID into Grafana.
+## 4. Secrets
+
 ```bash
-# 1. Extract Terragrunt outputs (OIDC URLs, Client IDs, IAM ARNs) into rendered Helm templates
-make render-helm-values
-
-# 2. Install the complete Observability stack (Grafana, Loki, Mimir, Tempo, Alloy)
-make init
-make install
+make external-secrets              # ESO with its IRSA role
+make eso-seed ENVIRONMENT=$ENVIRONMENT
 ```
 
-### 6. Validation (SSO Login)
-Once the pods are running and stable, you can validate the authentication flow.
+## 5. Install
+
 ```bash
-# 1. Port-forward Grafana to your local machine (if not exposed via Ingress)
-make pf-grafana
+make install       # init (namespaces + ExternalSecrets) and every component
 ```
-1. Open your browser and navigate to `http://localhost:8080`.
-2. You should see the **"Sign in with Keycloak"** button.
-3. Click the button and log in with a valid Keycloak user.
-4. You will be redirected back to Grafana and instantly granted access with a role (e.g. `GrafanaAdmin`, `Editor`, or `Viewer`) mapped dynamically based on your Keycloak permissions!
+
+## 6. Validate SSO
+
+```bash
+make pf-grafana    # http://localhost:3000
+```
+
+1. For a port-forward login, `root_url` and the Keycloak redirect URIs must allow `http://localhost:3000`. See [Grafana-SSO-Production.md](Grafana-SSO-Production.md) §5.
+2. You should see **Sign in with Keycloak**. Log in with a Keycloak user.
+3. Grafana maps your Keycloak roles to `GrafanaAdmin`, `Editor` or `Viewer`.
+4. In Explore, check **Loki** (`{source="pod"}`) and **Mimir** (`up`) for the data of `$ENVIRONMENT`.

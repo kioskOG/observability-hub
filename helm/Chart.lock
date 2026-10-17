@@ -1,0 +1,30 @@
+dependencies:
+- name: kube-prometheus-stack
+  repository: https://prometheus-community.github.io/helm-charts
+  version: 75.5.0
+- name: mimir-distributed
+  repository: https://grafana.github.io/helm-charts
+  version: 5.7.0
+- name: loki
+  repository: https://grafana.github.io/helm-charts
+  version: 6.30.1
+- name: tempo-distributed
+  repository: https://grafana.github.io/helm-charts
+  version: 1.42.2
+- name: alloy
+  repository: https://grafana.github.io/helm-charts
+  version: 1.2.1
+- name: pyroscope
+  repository: https://grafana.github.io/helm-charts
+  version: 1.14.0
+- name: prometheus-blackbox-exporter
+  repository: https://prometheus-community.github.io/helm-charts
+  version: 11.0.0
+- name: beyla
+  repository: https://grafana.github.io/helm-charts
+  version: 1.16.8
+- name: external-secrets
+  repository: https://charts.external-secrets.io
+  version: 2.11.0
+digest: sha256:d760a5a325bff8a5d4f28dc9ed725b92a2b4f3c6e74c63efbdaa3a68b9d86dc3
+generated: "2026-10-17T15:10:33.519617+05:30"

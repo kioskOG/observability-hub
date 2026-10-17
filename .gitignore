@@ -39,3 +39,5 @@ mimir/.htpasswd
 **/mimir-override-values.rendered.yaml
 **/pyroscope-override-values.rendered.yaml
 **/prometheus-override-values.rendered.yaml
+# Chart archives downloaded by `make charts` (versions are pinned in helm/Chart.yaml + Chart.lock)
+helm/charts/

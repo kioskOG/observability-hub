@@ -12,17 +12,18 @@ How it works:
 
 
 
-# kubectl create namespace alloy-logs
+## Install
 
-# kubectl apply -f alloy-logs-configMap.yml
+The Alloy configs are `config/daemonset.alloy` and `config/events.alloy`. The Makefile passes them with `--set-file alloy.configMap.content=…`, and the chart renders them through Helm `tpl` (so `.Values.kafka` / `.Values.traceSampling` gates work). The values files hold only chart overrides.
 
-# helm repo add grafana https:grafana.github.io/helm-charts
-# helm repo update
+```bash
+make install-alloy          # DaemonSet: alloy-override-values.yaml
+make install-alloy-events   # single-replica Kubernetes events collector: alloy-events-values.yaml
+make status-alloy
+kubectl -n alloy-logs logs ds/grafana-alloy --tail=100
+```
 
-# helm upgrade --install grafana-alloy grafana/alloy -f alloy-override-values.yaml --namespace alloy-logs
-
-# kubectl get pods -n alloy-logs -l app.kubernetes.io/name=grafana-alloy
-# kubectl logs -n alloy-logs -l app.kubernetes.io/name=grafana-alloy --tail=100
+`ENVIRONMENT_NAME` (in `extraEnv` of both files) is the Loki tenant and must match the `loki-writer-<env>` credential in Secret `alloy-remote-credentials`. See the README section [Multi-tenancy](../README.md#multi-tenancy-loki-and-mimir).
 
 
 
@@ -41,10 +42,10 @@ How it works:
 | Component                                        | Type                | Purpose                                                                                                                                                                              |
 | ------------------------------------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `loki.source.file "pod_logs"`                    | Source              | Reads logs from matched files (via `local.file_match`) and forwards them to the `loki.process.pod_logs` pipeline.                                                                    |
-| `loki.source.kubernetes_events "cluster_events"` | Source              | Ingests Kubernetes events for additional cluster-level visibility.                                                                                                                   |
+| `loki.source.kubernetes_events "cluster_events"` | Source              | Kubernetes events. Runs only in the single-replica `grafana-alloy-events` release (`alloy-events-values.yaml`), not in the DaemonSet.                                                 |
 | `loki.process "pod_logs"`                        | Processing Pipeline | Handles log parsing, CRI/Docker decoding, label extraction, regex extraction (e.g., `status_code`), and JSON decoding. Also attaches static labels like `cluster`. Forwards to Loki. |
 | `loki.process "cluster_events"`                  | Processing          | Labels Kubernetes events and forwards to Loki.                                                                                                                                       |
-| `loki.write "loki"`                              | Exporter            | Sends all processed logs to Loki. Uses custom headers (auth + tenant).                                                                                                               |
+| `loki.write "loki"`                              | Exporter            | Sends all processed logs to Loki with basic auth (`loki-writer-<env>`) and `tenant_id = ENVIRONMENT_NAME`.                                                                           |
 
 
 ## 🔄 3. OpenTelemetry Traces Pipeline

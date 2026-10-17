@@ -1,9 +1,11 @@
 .DEFAULT_GOAL := help
-
-
+.SECONDEXPANSION:
 
 # -------------------------------------
-# Namespaces
+# Components: namespace, Helm release, chart, version, values
+# Every chart comes from an upstream repo, pinned here. Values files only hold overrides.
+
+COMPONENTS = kube-prometheus-stack mimir loki tempo alloy alloy-events pyroscope blackbox beyla
 
 NAMESPACE_loki  = loki
 NAMESPACE_tempo = tempo
@@ -15,45 +17,64 @@ NAMESPACE_pyroscope = pyroscope
 NAMESPACE_blackbox = monitoring
 NAMESPACE_beyla = beyla
 
-# -------------------------------------
-# Chart sources
+RELEASE_loki  = loki
+RELEASE_tempo = tempo
+RELEASE_alloy = grafana-alloy
+RELEASE_alloy-events = grafana-alloy-events
+RELEASE_mimir = mimir
+RELEASE_kube-prometheus-stack = kube-prometheus-stack
+RELEASE_pyroscope = pyroscope
+RELEASE_blackbox = prometheus-blackbox-exporter
+RELEASE_beyla = beyla
 
-CHART_loki  = grafana/loki
-CHART_tempo = grafana/tempo-distributed
-CHART_alloy = grafana/alloy
-CHART_alloy-events = grafana/alloy
-CHART_mimir = grafana/mimir-distributed
-CHART_kps   = ./kube-prometheus-stack
-CHART_pyroscope = grafana/pyroscope
-CHART_blackbox = prometheus-community/prometheus-blackbox-exporter
-CHART_beyla = grafana/beyla
+# Chart versions are declared once, in helm/Chart.yaml, and locked in helm/Chart.lock.
+# `make charts` downloads exactly those archives into helm/charts/; installs use the local archive.
+HUB_CHART_DIR = helm
+# chart_version,<chart name>: version of that dependency in helm/Chart.yaml.
+chart_version = $(shell awk '/^  - name:/{n=$$3} /^    version:/{if (n=="$1") print $$2}' $(HUB_CHART_DIR)/Chart.yaml)
+chart_archive = $(HUB_CHART_DIR)/charts/$1-$(call chart_version,$1).tgz
 
-# -------------------------------------
-# Chart versions
+CHART_loki  = $(call chart_archive,loki)
+CHART_tempo = $(call chart_archive,tempo-distributed)
+CHART_alloy = $(call chart_archive,alloy)
+CHART_alloy-events = $(CHART_alloy)
+CHART_mimir = $(call chart_archive,mimir-distributed)
+CHART_kube-prometheus-stack = $(call chart_archive,kube-prometheus-stack)
+CHART_pyroscope = $(call chart_archive,pyroscope)
+CHART_blackbox = $(call chart_archive,prometheus-blackbox-exporter)
+CHART_beyla = $(call chart_archive,beyla)
+CHART_external-secrets = $(call chart_archive,external-secrets)
 
-VERSION_loki  = 6.30.1
-VERSION_tempo = 1.42.2
-VERSION_alloy = 1.2.1
-VERSION_alloy-events = $(VERSION_alloy)
-VERSION_mimir = 5.7.0
-VERSION_pyroscope = 1.14.0
-VERSION_blackbox = 11.0.0
-VERSION_beyla = 1.16.8
+# Rendered from *-values-template.yaml by render-helm-values (git-ignored).
+RENDERED_loki  = ./loki/loki-override-values.rendered.yaml
+RENDERED_tempo = ./tempo/tempo-override-values.rendered.yaml
+RENDERED_mimir = ./mimir/mimir-override-values.rendered.yaml
+RENDERED_pyroscope = ./pyroscope/pyroscope-override-values.rendered.yaml
+RENDERED_kube-prometheus-stack = ./kube-prometheus-stack/prometheus-override-values.rendered.yaml
+RENDERED_ALL = $(RENDERED_loki) $(RENDERED_tempo) $(RENDERED_mimir) $(RENDERED_pyroscope) $(RENDERED_kube-prometheus-stack)
 
-# -------------------------------------
-# -------------------------------------
-# Values files
-
-VALUES_loki  = ./loki/loki-override-values.rendered.yaml
-VALUES_tempo = ./tempo/tempo-override-values.rendered.yaml
+VALUES_loki  = $(RENDERED_loki)
+VALUES_tempo = $(RENDERED_tempo)
+VALUES_mimir = $(RENDERED_mimir)
+VALUES_pyroscope = $(RENDERED_pyroscope)
+VALUES_kube-prometheus-stack = ./kube-prometheus-stack/prometheus-values.yaml $(RENDERED_kube-prometheus-stack)
 VALUES_alloy = ./alloy/alloy-override-values.yaml
 VALUES_alloy-events = ./alloy/alloy-events-values.yaml
-VALUES_mimir = ./mimir/mimir-override-values.rendered.yaml
-VALUES_kps   = ./kube-prometheus-stack/prometheus-values.yaml
-VALUES_kps_override = ./kube-prometheus-stack/prometheus-override-values.rendered.yaml
-VALUES_pyroscope = ./pyroscope/pyroscope-override-values.rendered.yaml
 VALUES_blackbox = ./blackbox-exporter/values.yaml
 VALUES_beyla = ./beyla/beyla-values.yaml
+
+# Extra helm args per component.
+ARGS_alloy = --set-file alloy.configMap.content=./alloy/config/daemonset.alloy
+ARGS_alloy-events = --set-file alloy.configMap.content=./alloy/config/events.alloy
+ARGS_kube-prometheus-stack = $(if $(strip $(CLUSTER_NAME)),--set clusterName="$(CLUSTER_NAME)",)
+ARGS_mimir = --timeout 15m
+ARGS_beyla = --create-namespace
+
+# DEBUG=1 adds --debug to helm commands.
+HELM_FLAGS = $(if $(DEBUG),--debug,)
+
+# helm_args,<component>: locked chart archive, namespace, values and extra args (shared by install + template).
+helm_args = $(CHART_$1) -n $(NAMESPACE_$1) $(addprefix --values ,$(VALUES_$1)) $(ARGS_$1) $(HELM_FLAGS)
 
 # -------------------------------------
 # Cluster / region resolution
@@ -64,7 +85,7 @@ REGION := $(shell AWS_REGION='$(AWS_REGION)' AWS_DEFAULT_REGION='$(AWS_DEFAULT_R
 AWS_REGION := $(REGION)
 TMP_DIR ?= /tmp/observability-hub-eso
 ESO_SECRET_PREFIX ?= observability-hub
-HELM_KPS_CLUSTER_SET = $(if $(strip $(CLUSTER_NAME)),--set clusterName="$(CLUSTER_NAME)",)
+CLUSTER_LOWER = $(shell echo '$(CLUSTER_NAME)' | tr '[:upper:]' '[:lower:]')
 
 show-env:
 	@chmod +x $(RESOLVE_ENV)
@@ -73,22 +94,24 @@ show-env:
 
 # Existing Terragrunt layout
 TG_MLOPS_DIR   ?= terragrunt/infrastructure-live/accounts/mlops
-TG_S3_DIR      ?= $(TG_MLOPS_DIR)/us-east-2/s3
+TG_S3_DIR      ?= $(TG_MLOPS_DIR)/$(REGION)/s3
 TG_IAM_ROLE_DIR ?= $(TG_MLOPS_DIR)/global/iam/role
-OBS_S3_STACKS ?= \
-	millenniumfalcon-loki-chunks \
-	millenniumfalcon-loki-ruler \
-	millenniumfalcon-mimir-chunks \
-	millenniumfalcon-mimir-ruler \
-	millenniumfalcon-tempo-chunks \
-	millenniumfalcon-pyroscope-chunks
+# Bucket stacks are named {cluster_lower}-<bucket>, the same names render-observability-helm-and-state.sh puts in the values.
+OBS_S3_STACKS ?= $(addprefix $(CLUSTER_LOWER)-,loki-chunks loki-ruler mimir-chunks mimir-ruler tempo-chunks pyroscope-chunks)
+
+# Fail early when CLUSTER_NAME / REGION are unresolved or a bucket stack directory is missing.
+check-s3-stacks:
+	@test -n "$(CLUSTER_NAME)" -a -n "$(REGION)" || { echo "ERROR: CLUSTER_NAME/REGION unresolved (make show-env)"; exit 1; }
+	@for s in $(OBS_S3_STACKS); do \
+		test -d "$(TG_S3_DIR)/$$s" || { echo "ERROR: missing Terragrunt stack $(TG_S3_DIR)/$$s"; exit 1; }; \
+	done
 
 # -------------------------------------
 # AWS via Terragrunt
 # use -auto-approve if you don't want to Approve/Reject the apply & destroy.
 # -------------------------------------
 
-aws-plan-s3:
+aws-plan-s3: check-s3-stacks
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 plan s3/$$s"; \
 		(cd $(TG_S3_DIR)/$$s && terragrunt plan); \
@@ -100,7 +123,7 @@ aws-plan-iam:
 
 aws-plan: aws-plan-s3 aws-plan-iam
 
-aws-apply-s3:
+aws-apply-s3: check-s3-stacks
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 apply s3/$$s"; \
 		(cd $(TG_S3_DIR)/$$s && terragrunt apply ); \
@@ -113,7 +136,7 @@ aws-apply-iam:
 
 aws-apply: aws-apply-s3 aws-apply-iam
 
-aws-destroy-s3:
+aws-destroy-s3: check-s3-stacks
 	@echo "👉 destroy observability S3 buckets"
 	@for s in $(OBS_S3_STACKS); do \
 		echo "👉 destroy s3/$$s"; \
@@ -138,14 +161,34 @@ render-helm-values:
 # -------------------------------------
 # Helm repo & namespace bootstrap
 
-init:
-	@echo "👉 Provisioning AWS S3 + IRSA via Terragrunt..."
-# 	@$(MAKE) aws-apply
+# -------------------------------------
+# Charts (helm/Chart.yaml + helm/Chart.lock)
+
+helm-repos:
+	@helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
+	@helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
+	@helm repo add external-secrets https://charts.external-secrets.io >/dev/null 2>&1 || true
+
+# Download the locked chart archives into helm/charts/.
+charts: helm-repos
+	helm dependency build $(HUB_CHART_DIR)
+
+# After changing a version in helm/Chart.yaml: re-resolve, rewrite Chart.lock, download. Commit both files.
+charts-update: helm-repos
+	helm dependency update $(HUB_CHART_DIR)
+
+# Show what is pinned.
+charts-list:
+	@helm dependency list $(HUB_CHART_DIR)
+
+# An archive is fetched only when missing: its name carries the version, so bumping a version in
+# helm/Chart.yaml (+ make charts-update) is what triggers a download. Output goes to stderr so that
+# template-debug-* stays clean YAML.
+$(HUB_CHART_DIR)/charts/%.tgz:
+	@$(MAKE) charts >&2
+
+init: charts
 	@kubectl apply -f ./default-storage-class.yaml
-	@echo "👉 Adding Helm repo if missing and updating..."
-	@helm repo add grafana https://grafana.github.io/helm-charts || true
-	@helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-	@helm repo update
 	@echo "👉 Ensuring required namespaces exist..."
 	@for ns in $(NAMESPACE_loki) $(NAMESPACE_tempo) $(NAMESPACE_alloy) $(NAMESPACE_mimir) $(NAMESPACE_kube-prometheus-stack) $(NAMESPACE_pyroscope) $(NAMESPACE_blackbox) $(NAMESPACE_beyla); do \
 		if ! kubectl get namespace $$ns > /dev/null 2>&1; then \
@@ -177,73 +220,39 @@ aws-cleanup:
 # -------------------------------------
 # Install Targets
 
-install-loki:
-	helm upgrade --install loki $(CHART_loki) \
-		--version $(VERSION_loki) \
-		-n $(NAMESPACE_loki) \
-		--values $(VALUES_loki) \
-		--debug
+# Rendered values are rebuilt when their template changes. Run `make render-helm-values` yourself after
+# Terragrunt outputs change (bucket names, IRSA roles, Keycloak endpoints); `make install` always does.
+%-override-values.rendered.yaml: %-values-template.yaml
+	@$(MAKE) render-helm-values
 
-install-tempo:
-	helm upgrade --install tempo $(CHART_tempo) \
-		--version $(VERSION_tempo) \
-		-n $(NAMESPACE_tempo) \
-		--values $(VALUES_tempo) \
-		--debug
+install-kube-prometheus-stack: $(CHART_kube-prometheus-stack) $(RENDERED_kube-prometheus-stack)
+	@echo "👉 kube-prometheus-stack: clusterName=$(if $(strip $(CLUSTER_NAME)),$(CLUSTER_NAME),<unset: chart default>)"
+	helm upgrade --install $(RELEASE_kube-prometheus-stack) $(call helm_args,kube-prometheus-stack)
 
-install-alloy: apply-alloy-manifests
-	helm upgrade --install grafana-alloy $(CHART_alloy) \
-		--version $(VERSION_alloy) \
-		-n $(NAMESPACE_alloy) \
-		--values $(VALUES_alloy) \
-		--debug
+install-mimir: $(CHART_mimir) $(RENDERED_mimir)
+	helm upgrade --install $(RELEASE_mimir) $(call helm_args,mimir)
+
+install-loki: $(CHART_loki) $(RENDERED_loki)
+	helm upgrade --install $(RELEASE_loki) $(call helm_args,loki)
+
+install-tempo: $(CHART_tempo) $(RENDERED_tempo)
+	helm upgrade --install $(RELEASE_tempo) $(call helm_args,tempo)
+
+install-pyroscope: $(CHART_pyroscope) $(RENDERED_pyroscope)
+	helm upgrade --install $(RELEASE_pyroscope) $(call helm_args,pyroscope)
+
+install-alloy: $(CHART_alloy) apply-alloy-manifests
+	helm upgrade --install $(RELEASE_alloy) $(call helm_args,alloy)
 
 # Single-replica Kubernetes events collector (events must not be collected by the DaemonSet: N× duplicates).
-install-alloy-events: apply-alloy-manifests
-	helm upgrade --install grafana-alloy-events $(CHART_alloy-events) \
-		--version $(VERSION_alloy-events) \
-		-n $(NAMESPACE_alloy-events) \
-		--values $(VALUES_alloy-events) \
-		--debug
+install-alloy-events: $(CHART_alloy-events) apply-alloy-manifests
+	helm upgrade --install $(RELEASE_alloy-events) $(call helm_args,alloy-events)
 
-install-mimir:
-	helm upgrade --install mimir $(CHART_mimir) \
-		--version $(VERSION_mimir) \
-		-n $(NAMESPACE_mimir) \
-		--values $(VALUES_mimir) \
-		--timeout 15m \
-		--debug
+install-blackbox: $(CHART_blackbox)
+	helm upgrade --install $(RELEASE_blackbox) $(call helm_args,blackbox)
 
-install-kube-prometheus-stack:
-	@$(if $(strip $(CLUSTER_NAME)),echo "👉 kube-prometheus-stack: clusterName=$(CLUSTER_NAME)";,echo "👉 kube-prometheus-stack: CLUSTER_NAME unset — using prometheus-values.yaml only";)
-	helm upgrade --install kube-prometheus-stack $(CHART_kps) \
-		-n $(NAMESPACE_kube-prometheus-stack) \
-		--values $(VALUES_kps) \
-		--values $(VALUES_kps_override) \
-		$(HELM_KPS_CLUSTER_SET) \
-		--debug
-
-install-pyroscope:
-	helm upgrade --install pyroscope $(CHART_pyroscope) \
-		--version $(VERSION_pyroscope) \
-		-n $(NAMESPACE_pyroscope) \
-		--values $(VALUES_pyroscope) \
-		--debug
-
-install-blackbox:
-	helm upgrade --install prometheus-blackbox-exporter $(CHART_blackbox) \
-		--version $(VERSION_blackbox) \
-		-n $(NAMESPACE_blackbox) \
-		--values $(VALUES_blackbox) \
-		--debug
-
-install-beyla:
-	helm upgrade --install beyla $(CHART_beyla) \
-		--version $(VERSION_beyla) \
-		-n $(NAMESPACE_beyla) \
-		--create-namespace \
-		--values $(VALUES_beyla) \
-		--debug
+install-beyla: $(CHART_beyla)
+	helm upgrade --install $(RELEASE_beyla) $(call helm_args,beyla)
 
 # -------------------------------------
 # Port-forward Targets
@@ -261,102 +270,57 @@ pf-faro:
 
 # -------------------------------------
 # Uninstall Targets
-uninstall-loki:
-	helm uninstall loki -n $(NAMESPACE_loki) || true
+uninstall-%:
+	helm uninstall $(RELEASE_$*) -n $(NAMESPACE_$*) || true
 
-uninstall-tempo:
-	helm uninstall tempo -n $(NAMESPACE_tempo) || true
+# Reverse install order: collectors first, backends last.
+uninstall: uninstall-beyla uninstall-blackbox uninstall-pyroscope uninstall-alloy-events uninstall-alloy \
+	uninstall-tempo uninstall-loki uninstall-mimir uninstall-kube-prometheus-stack
 
-uninstall-mimir:
-	helm uninstall mimir -n $(NAMESPACE_mimir) || true
+OBS_NAMESPACES = $(sort $(foreach c,$(COMPONENTS),$(NAMESPACE_$(c))))
 
-uninstall-kube-prometheus-stack:
-	helm uninstall kube-prometheus-stack -n $(NAMESPACE_kube-prometheus-stack) || true
-
-uninstall-alloy:
-	helm uninstall grafana-alloy -n $(NAMESPACE_alloy) || true
-
-uninstall-alloy-events:
-	helm uninstall grafana-alloy-events -n $(NAMESPACE_alloy-events) || true
-
-uninstall-blackbox:
-	helm uninstall prometheus-blackbox-exporter -n $(NAMESPACE_blackbox) || true
-
-uninstall-pyroscope:
-	helm uninstall pyroscope -n $(NAMESPACE_pyroscope) || true
-
-uninstall-beyla:
-	helm uninstall beyla -n $(NAMESPACE_beyla) || true
-
-uninstall:
-	helm uninstall loki -n $(NAMESPACE_loki) || true
-	helm uninstall tempo -n $(NAMESPACE_tempo) || true
-	helm uninstall mimir -n $(NAMESPACE_mimir) || true
-	helm uninstall kube-prometheus-stack -n $(NAMESPACE_kube-prometheus-stack) || true
-	helm uninstall pyroscope -n $(NAMESPACE_pyroscope) || true
-	helm uninstall prometheus-blackbox-exporter -n $(NAMESPACE_blackbox) || true
-	helm uninstall beyla -n $(NAMESPACE_beyla) || true
-
-# Extra cleanup
+# Extra cleanup: ExternalSecrets, PVCs + their EBS volumes, namespaces. DESTRUCTIVE (telemetry in PVCs is lost).
+# gp2-standard has reclaimPolicy: Retain, so deleting a PVC alone leaves the PV and its EBS volume behind.
+# The PVs are switched to Delete first so the EBS CSI driver removes the volumes.
 uninstall-cleanup:
 	@echo "🧹 Cleaning up Kubernetes resources created by this Makefile..."
-	@echo "🗑 Deleting ExternalSecrets + synced Secrets..."
-	-kubectl delete externalsecret loki-basic-auth canary-basic-auth -n $(NAMESPACE_loki) || true
-	-kubectl delete externalsecret mimir-basic-auth -n $(NAMESPACE_mimir) || true
-	-kubectl delete externalsecret mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) || true
-	-kubectl delete externalsecret alloy-remote-credentials -n $(NAMESPACE_alloy) || true
-	-kubectl delete externalsecret tempo-mimir-remote-write -n $(NAMESPACE_tempo) || true
-	-kubectl delete externalsecret loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) || true
-	-kubectl delete secret loki-basic-auth -n $(NAMESPACE_loki) || true
-	-kubectl delete secret canary-basic-auth -n $(NAMESPACE_loki) || true
-	-kubectl delete secret mimir-basic-auth -n $(NAMESPACE_mimir) || true
-	-kubectl delete secret mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) || true
-	-kubectl delete secret alloy-remote-credentials -n $(NAMESPACE_alloy) || true
-	-kubectl delete secret tempo-mimir-remote-write -n $(NAMESPACE_tempo) || true
-	-kubectl delete secret loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) || true
-
-	@echo "🗑 Deleting ConfigMaps..."
-	-kubectl delete configmap alloy-config -n $(NAMESPACE_alloy) || true
-
-	@echo "🗑 Deleting PersistentVolumeClaims..."
-	-kubectl delete pvc -n $(NAMESPACE_mimir) --all --force || true
-	-kubectl delete pvc -n $(NAMESPACE_loki) --all --force || true
-	-kubectl delete pvc -n $(NAMESPACE_tempo) --all --force || true
-	-kubectl delete pvc -n $(NAMESPACE_kube-prometheus-stack) --all --force || true
-	-kubectl delete pvc -n $(NAMESPACE_pyroscope) --all --force || true
-	-kubectl delete pvc -n $(NAMESPACE_blackbox) --all --force || true
-
+	@echo "🗑 Deleting ExternalSecrets (ESO then removes the synced Secrets)..."
+	-kubectl delete externalsecret loki-basic-auth canary-basic-auth loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) --ignore-not-found
+	-kubectl delete externalsecret mimir-basic-auth -n $(NAMESPACE_mimir) --ignore-not-found
+	-kubectl delete externalsecret mimir-remote-write-credentials grafana-auth-secrets grafana-admin-credentials -n $(NAMESPACE_kube-prometheus-stack) --ignore-not-found
+	-kubectl delete externalsecret alloy-remote-credentials -n $(NAMESPACE_alloy) --ignore-not-found
+	-kubectl delete externalsecret tempo-mimir-remote-write -n $(NAMESPACE_tempo) --ignore-not-found
+	@echo "🗑 Releasing PersistentVolumes (reclaimPolicy → Delete) and deleting PVCs..."
+	@for ns in $(OBS_NAMESPACES); do \
+		for pv in $$(kubectl get pvc -n $$ns -o jsonpath='{.items[*].spec.volumeName}' 2>/dev/null); do \
+			kubectl patch pv $$pv -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' >/dev/null && echo "   $$ns: $$pv → Delete"; \
+		done; \
+		kubectl delete pvc -n $$ns --all --wait=false --ignore-not-found; \
+	done
 	@echo "🗑 Deleting Namespaces..."
-	-kubectl delete namespace $(NAMESPACE_loki) --force || true
-	-kubectl delete namespace $(NAMESPACE_tempo) --force || true
-	-kubectl delete namespace $(NAMESPACE_alloy) --force || true
-	-kubectl delete namespace $(NAMESPACE_mimir) --force || true
-	-kubectl delete namespace $(NAMESPACE_kube-prometheus-stack) --force || true
-	-kubectl delete namespace $(NAMESPACE_pyroscope) --force || true
-	-kubectl delete namespace $(NAMESPACE_blackbox) --force || true
-	-kubectl delete namespace $(NAMESPACE_beyla) --force || true
-	@echo "✅ Cleanup done."
+	-kubectl delete namespace $(OBS_NAMESPACES) --ignore-not-found
+	@echo "✅ Cleanup done. Check for leftovers: kubectl get pv | grep Released"
 
-uninstall-all: uninstall uninstall-alloy uninstall-alloy-events uninstall-pyroscope uninstall-blackbox uninstall-beyla uninstall-cleanup
+uninstall-all: uninstall uninstall-cleanup
 
 # -------------------------------------
 # Status & Logs
 status-%:
 	kubectl get all -n $(NAMESPACE_$*) || true
 
+# Pods of one release (the chart's app.kubernetes.io/instance label), every container.
 logs-%:
-	kubectl logs -n $(NAMESPACE_$*) --tail=50 -l app.kubernetes.io/name=$* || true
+	kubectl logs -n $(NAMESPACE_$*) -l app.kubernetes.io/instance=$(RELEASE_$*) \
+		--all-containers --prefix --tail=50 --max-log-requests=20 || true
 
-template-debug-kube-prometheus-stack:
-	helm template kube-prometheus-stack $(CHART_kps) -n $(NAMESPACE_kube-prometheus-stack) --values $(VALUES_kps) $(HELM_KPS_CLUSTER_SET) --debug
+template-debug-%: $$(CHART_$$*)
+	helm template $(RELEASE_$*) $(call helm_args,$*)
 
-template-debug-%:
-	helm template $* $(CHART_$*) -n $(NAMESPACE_$*) --values $(VALUES_$*) --debug
-
-install: init install-kube-prometheus-stack install-mimir install-loki install-tempo install-alloy install-alloy-events install-pyroscope install-blackbox install-beyla
-status: status-loki status-tempo status-alloy status-alloy-events status-mimir status-kube-prometheus-stack status-pyroscope status-blackbox status-beyla
-logs: logs-loki logs-tempo logs-alloy logs-mimir logs-kube-prometheus-stack logs-pyroscope logs-blackbox logs-beyla
-template-debug: template-debug-loki template-debug-tempo template-debug-alloy template-debug-alloy-events template-debug-mimir template-debug-kube-prometheus-stack template-debug-pyroscope template-debug-blackbox template-debug-beyla
+# render-helm-values first: Terragrunt outputs (buckets, IRSA, Keycloak) may have changed since the last render.
+install: render-helm-values init $(addprefix install-,$(COMPONENTS))
+status: $(addprefix status-,$(COMPONENTS))
+logs: $(addprefix logs-,$(COMPONENTS))
+template-debug: $(addprefix template-debug-,$(COMPONENTS))
 
 # =====================================================================
 # ==================== External Secrets Operator ======================
@@ -365,7 +329,6 @@ template-debug: template-debug-loki template-debug-tempo template-debug-alloy te
 AWS_PAGER              ?=                                     # avoid "press q"
 ESO_NAMESPACE          ?= external-secrets
 ESO_HELM_REPO          ?= https://charts.external-secrets.io
-ESO_CHART              ?= external-secrets
 ESO_HELM_RELEASE       ?= external-secrets
 ESO_SERVICE_ACCOUNT    ?= external-secrets
 
@@ -379,12 +342,12 @@ eso-init:
 	  kubectl create namespace $(ESO_NAMESPACE); \
 	fi
 
-eso-install:
+eso-install: $(CHART_external-secrets)
 	@echo "🚀 Installing/Upgrading External Secrets Operator via Helm (consuming Terragrunt outputs)"
 	@ESO_ROLE_ARN=$$(cd $(TG_IAM_ROLE_DIR) && terragrunt output -json | jq -r '.iam_role_arns.value.ESOControllerServiceAccountRole' 2>/dev/null); \
 	echo "👉 ESO IRSA Role ARN: $$ESO_ROLE_ARN"; \
 	if [ -z "$$ESO_ROLE_ARN" ] || [ "$$ESO_ROLE_ARN" = "null" ]; then echo "ERROR: Could not fetch ESO_ROLE_ARN from Terragrunt."; exit 1; fi; \
-	AWS_PAGER="" helm upgrade --install $(ESO_HELM_RELEASE) external-secrets/$(ESO_CHART) \
+	AWS_PAGER="" helm upgrade --install $(ESO_HELM_RELEASE) $(CHART_external-secrets) \
 	  -n $(ESO_NAMESPACE) \
 	  --set installCRDs=true \
 	  --set serviceAccount.create=true \
@@ -436,7 +399,7 @@ eso-check-store:
 
 eso-seed:
 	@chmod +x ./external-secrets/seed-aws-secrets.sh
-	@REGION="$(REGION)" ESO_SECRET_PREFIX="$(ESO_SECRET_PREFIX)" ./external-secrets/seed-aws-secrets.sh
+	@ENVIRONMENT="$(ENVIRONMENT)" REGION="$(REGION)" ESO_SECRET_PREFIX="$(ESO_SECRET_PREFIX)" ./external-secrets/seed-aws-secrets.sh
 
 eso-apply:
 	@chmod +x $(RESOLVE_ENV)
@@ -464,6 +427,7 @@ eso-apply:
 	@kubectl apply -f ./external-secrets/externalsecret-alloy-remote-credentials.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-mimir-remote-write.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-grafana-auth.yaml
+	@kubectl apply -f ./external-secrets/externalsecret-grafana-admin.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-tempo-mimir-remote-write.yaml
 	@kubectl apply -f ./external-secrets/externalsecret-loki-ruler-mimir-remote-write.yaml
 	@$(MAKE) eso-wait
@@ -476,6 +440,7 @@ eso-wait:
 	@kubectl wait --for=condition=Ready externalsecret/alloy-remote-credentials -n $(NAMESPACE_alloy) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/mimir-remote-write-credentials -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/grafana-auth-secrets -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
+	@kubectl wait --for=condition=Ready externalsecret/grafana-admin-credentials -n $(NAMESPACE_kube-prometheus-stack) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/tempo-mimir-remote-write -n $(NAMESPACE_tempo) --timeout=180s
 	@kubectl wait --for=condition=Ready externalsecret/loki-ruler-mimir-remote-write -n $(NAMESPACE_loki) --timeout=180s
 	@echo "✅ ExternalSecrets synced"
@@ -487,11 +452,31 @@ eso-wait:
 
 external-secrets: eso-init eso-install eso-status
 
+# Set the Grafana local admin password to the one in Secret grafana-admin-credentials.
+# GF_SECURITY_ADMIN_PASSWORD only applies when Grafana creates its database, and every replica has its
+# own SQLite DB, so an existing install needs this after eso-seed (first rollout or rotation).
+grafana-admin-reset:
+	@pods=$$(kubectl get pods -n $(NAMESPACE_kube-prometheus-stack) -l app.kubernetes.io/name=grafana,app.kubernetes.io/instance=$(RELEASE_kube-prometheus-stack) -o name); \
+	test -n "$$pods" || { echo "ERROR: no Grafana pods in $(NAMESPACE_kube-prometheus-stack)"; exit 1; }; \
+	for p in $$pods; do \
+		kubectl get secret grafana-admin-credentials -n $(NAMESPACE_kube-prometheus-stack) -o jsonpath='{.data.admin-password}' | base64 -d | \
+		kubectl exec -i -n $(NAMESPACE_kube-prometheus-stack) $$p -c grafana -- grafana cli admin reset-admin-password --password-from-stdin >/dev/null \
+		&& echo "✅ $$p: admin password reset" || { echo "ERROR: reset failed on $$p"; exit 1; }; \
+	done
+
 help:
 	@echo "🚀 Observability Hub Deployment Makefile"
-	@echo "  make aws-apply           - Terragrunt apply for all infrastructure"
-	@echo "  make aws-destroy         - Terragrunt destroy for all infrastructure"
-	@echo "  make external-secrets    - Deploy ESO using Terragrunt IAM outputs"
-	@echo "  make eso-seed            - Create AWS Secrets Manager values"
-	@echo "  make install             - Deploy observability stack"
-	@echo "  make uninstall           - Tear down stack"
+	@echo "  Install order (see README 'Complete installation'):"
+	@echo "  make show-env                      - Resolved CLUSTER_NAME / REGION"
+	@echo "  make aws-apply                     - S3 + IRSA via Terragrunt, then render-helm-values"
+	@echo "  make external-secrets              - Deploy ESO using Terragrunt IAM outputs"
+	@echo "  make eso-seed ENVIRONMENT=<env>    - Create/rotate gateway credentials (env: prod|stage|dev)"
+	@echo "  make install                       - init (ExternalSecrets) + every component"
+	@echo ""
+	@echo "  make install-<component>           - Upgrade one component"
+	@echo "  make charts-list / charts-update   - Pinned charts (helm/Chart.yaml + Chart.lock)"
+	@echo "  make render-helm-values            - Re-render *-values-template.yaml"
+	@echo "  make grafana-admin-reset          - Apply the Secrets Manager admin password to Grafana"
+	@echo "  make status / logs / eso-check-store"
+	@echo "  make uninstall-all                 - Helm uninstall + delete PVCs/namespaces"
+	@echo "  make aws-destroy                   - Terragrunt destroy S3 + IRSA (data loss)"

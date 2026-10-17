@@ -10,6 +10,6 @@ resource "aws_route_table_association" "pri_route_association" {
   count          = length(var.private_subnet_cidr_block)
   depends_on     = [aws_subnet.private_subnet, aws_route_table.pri_sub_route]
   subnet_id      = element(aws_subnet.private_subnet[*].id, count.index)
-  route_table_id = aws_route_table.pri_sub_route.id
+  route_table_id = local.private_route_table_by_az[aws_subnet.private_subnet[count.index].availability_zone]
 }
 

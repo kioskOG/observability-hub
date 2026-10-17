@@ -91,3 +91,8 @@ variable "sg_ingress_rules" {
     },
   ]
 }
+variable "nat_gateway_per_az" {
+  description = "One NAT gateway (and private route table) per AZ that has a public subnet, so egress survives an AZ outage. false = the single NAT gateway in the first public subnet serves every private subnet."
+  type        = bool
+  default     = false
+}

@@ -1,80 +1,38 @@
-# Kube Prometheus Stack
+# kube-prometheus-stack
 
-**Kube Prometheus Stack** is a comprehensive monitoring stack specifically designed for Kubernetes. It brings together multiple components to provide detailed insights into your cluster's health and performance.
+Prometheus Operator, Prometheus (2 replicas, remote-write to Mimir), Grafana (Keycloak SSO, Loki/Mimir/Tempo/Pyroscope datasources), Alertmanager (the stack's only one), kube-state-metrics and node-exporter.
 
+The chart is the upstream `prometheus-community/kube-prometheus-stack`, pinned in [`helm/Chart.yaml`](../helm/Chart.yaml) and locked in `helm/Chart.lock`. This directory holds only values:
 
-* **Prometheus**: This is the central monitoring system that collects and stores metrics from your Kubernetes cluster and its workloads. It uses a powerful query language (PromQL) to analyze and visualize the collected data.
+| File | Purpose |
+|------|---------|
+| `prometheus-values.yaml` | Overrides of the chart defaults: placement, resources, Prometheus HA + remote write, Grafana datasources and plugins, Alertmanager. Keep it to settings that differ from `helm show values helm/charts/kube-prometheus-stack-<version>.tgz` |
+| `prometheus-values-template.yaml` | Grafana SSO (`auth.generic_oauth`, `root_url`), rendered by `make render-helm-values` into `prometheus-override-values.rendered.yaml` (git-ignored) |
 
-* **Prometheus Operator**: This is a tool that simplifies the deployment and management of Prometheus instances on Kubernetes. It automates tasks such as scaling, upgrading, and configuration, making it easier to manage Prometheus in dynamic Kubernetes environments.
-
-* **Alertmanager**: Handles alerts sent by Prometheus based on predefined rules. It supports various notification channels such as email, Slack, and PagerDuty.
-
-* **Grafana**: Provides a user-friendly interface for visualizing metrics through customizable dashboards. It integrates seamlessly with Prometheus, allowing you to create real-time visualizations of your cluster's data.
-
-* **Kube-State-Metrics**: Exposes detailed metrics about the state of Kubernetes resources, such as Deployments, Pods, and Nodes.
-
-* **Node Exporter**: Collects hardware and OS-level metrics from the cluster nodes, such as CPU and memory usage.
-
-
-> [!NOTE]
-> Together, these components form a powerful stack that provides end-to-end visibility into your Kubernetes environment
-
-## Prerequisites
-
-1. A Kubernetes cluster (v1.19+ recommended).
-
-2. Helm 3 installed on your local system.
-
-3. kubectl installed and configured for your cluster.
-
-## Add the Prometheus Community Helm Repository
+## Install / upgrade
 
 ```bash
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
+make install-kube-prometheus-stack            # helm upgrade --install with both values files + clusterName
+make template-debug-kube-prometheus-stack     # same args, helm template
 ```
 
+`clusterName` is set from the resolved `CLUSTER_NAME` (`make show-env`) and becomes Prometheus's `cluster` external label. It must match Alloy's `KUBE_CLUSTER_NAME`.
 
-## Install the Kube Prometheus Stack Helm Chart
+## Access
 
 ```bash
-helm upgrade --install kube-prometheus-stack ./kube-prometheus-stack/ --namespace monitoring -f kube-prometheus-stack/prometheus-values.yaml
+make pf-grafana        # http://localhost:3000
+make pf-prometheus     # http://localhost:9090
 ```
 
-> [!NOTE]
-> * Replace `kube-prometheus-stack` with your preferred release name.
->
-> * The --namespace `monitoring` flag ensures that the stack is installed in a dedicated namespace.
+Log in to Grafana with Keycloak SSO; see [`../Docs/Grafana-SSO-Production.md`](../Docs/Grafana-SSO-Production.md).
 
+## Alerting
 
-## Accessing Grafana and Other Components
+Every alert source (Prometheus, the Loki ruler, the Mimir ruler) sends to this Alertmanager. No receivers are configured yet: the chart default routes everything to `null`. Configure `alertmanager.config` in `prometheus-values.yaml`, and keep receiver credentials in a Secret.
 
-### Retrieve the Grafana Admin Password
+## Upgrading the chart
 
-```bash
-kubectl get secret kube-prometheus-stack-grafana -n monitoring -o jsonpath="{.data.admin-password}" | base64 --decode ; echo
-```
-
-
-## Port Forward to Access Grafana
-
-```bash
-kubectl port-forward svc/kube-prometheus-stack-grafana -n monitoring 3000:80
-```
-
-Now, open your browser and navigate to [localhost](http://localhost:3000). Use the username admin and the retrieved password to log in.
-
-
-## Why Choose the Kube Prometheus Stack?
-The **Kube Prometheus Stack Helm Chart** is a community-driven solution that simplifies monitoring Kubernetes. With its comprehensive set of features and ease of deployment, it has become the go-to choice for DevOps teams worldwide.
-
-
-## Key Benefits:
-
-* **Ease of Deployment:** The Helm chart abstracts complex configurations.
-
-* **Scalability:** Designed to handle dynamic Kubernetes environments.
-
-* **Customizability:** Tailor every component to meet your needs.
-
-* **Community Support:** Backed by the Prometheus community.
+1. Read the chart's upgrade notes. Helm installs the operator CRDs on first install but never upgrades them, so apply new CRDs as those notes describe before upgrading.
+2. Bump its `version` in `helm/Chart.yaml`, run `make charts-update`, and commit `Chart.yaml` + `Chart.lock`.
+3. `make template-debug-kube-prometheus-stack` and review the diff, then `make install-kube-prometheus-stack`.

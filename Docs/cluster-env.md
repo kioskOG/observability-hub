@@ -26,7 +26,7 @@ export CLUSTER_NAME=millenniumfalcon
 export AWS_REGION=us-east-2
 
 make show-env
-make eso-iam-role
+make external-secrets
 make install-kube-prometheus-stack
 ```
 
@@ -44,7 +44,7 @@ make show-env   # CLUSTER_NAME + REGION from the ARN
 | Target | Uses cluster/region for |
 |--------|-------------------------|
 | `show-env` | Print resolved values + source |
-| `eso-iam-role` / `external-secrets` | EKS OIDC trust for IRSA |
+| `external-secrets` | ESO install with its IRSA role (from Terragrunt `global/iam/role` outputs) |
 | `eso-apply` / `eso-seed` | Secrets Manager region / ClusterSecretStore |
 | `install-kube-prometheus-stack` | Prometheus external label `clusterName` |
 | `render-helm-values` / `aws-apply` | Bucket naming + IRSA ARN render |

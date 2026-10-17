@@ -8,7 +8,7 @@ observabilityTolerations: &observabilityTolerations
     value: observability
     effect: NoSchedule
 
-# Pin AWS SDK default region for IRSA/S3 — must match where buckets live, not necessarily the EKS cluster region. script.sh sets s3_bucket_region (defaults to cluster region_name).
+# Pin AWS SDK default region for IRSA/S3 — must match where buckets live, not necessarily the EKS cluster region. make render-helm-values sets s3_bucket_region (defaults to the cluster region).
 global:
   extraEnv:
     - name: AWS_REGION
@@ -142,6 +142,8 @@ loki:
 
   querier:
       max_concurrent: 4
+      # Lets the "Loki (all environments)" Grafana datasource query X-Scope-OrgID: prod|stage|dev.
+      multi_tenant_queries_enabled: true
 
   storage:
       type: s3
@@ -430,12 +432,35 @@ gateway:
               '"$request" $body_bytes_sent "$http_referer" '
               '"$http_user_agent" "$http_x_forwarded_for"';
     # -- Allows appending custom configuration to the server block
-    serverSnippet: ""
-    # Loki chart runs this through tpl(); plain text $vars are fine. script.sh uses restricted envsubst so nginx $vars are not stripped.
+    # The query/tail locations set their own proxy_set_header, so they do NOT inherit the http-level
+    # X-Scope-OrgID override and forward the client's header as-is. Reject any request whose header
+    # differs from the tenant enforced for its user (rewrite phase: runs on every location).
+    serverSnippet: |
+      if ($loki_tenant_mismatch) {
+        return 403 'X-Scope-OrgID not allowed for this user';
+      }
+    # Tenant = environment, derived from the basic-auth user (never trusted from the client):
+    #   loki-writer-<env>  → <env>               (Alloy in that environment; prod | stage | dev)
+    #   loki-canary        → canary
+    #   grafana-reader     → client header, only if it is env tenants (multi-tenant "prod|stage|dev" allowed)
+    #   anyone else        → no tenant (Loki answers 401)
+    # Loki chart runs this through tpl(); plain text $vars are fine. render-helm-values uses restricted envsubst so nginx $vars are not stripped.
     httpSnippet: |
-      map $http_x_scope_orgid $loki_org_id {
-        ""      "loki-system";
-        default $http_x_scope_orgid;
+      map $http_x_scope_orgid $loki_reader_org_id {
+        "~^(prod|stage|dev)(\|(prod|stage|dev))*$" $http_x_scope_orgid;
+        default                                    "";
+      }
+      map $remote_user $loki_org_id {
+        "~^loki-writer-(prod|stage|dev)$" $1;
+        loki-canary                       canary;
+        grafana-reader                    $loki_reader_org_id;
+        default                           "";
+      }
+      # 0 when the client sent no header (push locations get it set below) or exactly the enforced tenant.
+      map "$http_x_scope_orgid#$loki_org_id" $loki_tenant_mismatch {
+        "~^#"           0;
+        "~^([^#]+)#\1$" 0;
+        default         1;
       }
       proxy_set_header X-Scope-OrgID $loki_org_id;
     # -- Allows customizing the `client_max_body_size` directive
@@ -476,7 +501,7 @@ lokiCanary:
   extraArgs:
     - -pass=$(LOKI_PASS)
     - -user=$(LOKI_USER)
-    - -tenant-id=loki-system
+    - -tenant-id=canary # gateway enforces tenant "canary" for user loki-canary
   extraEnv:
     - name: LOKI_PASS
       valueFrom:
