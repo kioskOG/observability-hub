@@ -24,10 +24,11 @@ config:
       endpoint: http://grafana-alloy.alloy-logs.svc.cluster.local:4317
     otel_metrics_export:
       endpoint: http://grafana-alloy.alloy-logs.svc.cluster.local:4317
+      # application_span / application_service_graph are NOT enabled: they emit the same series names
+      # as Alloy's spanmetrics (traces_spanmetrics_*) and Tempo's service graph (traces_service_graph_*).
+      # Beyla's traces already flow through Alloy, which derives both from the spans themselves.
       features:
         - application
-        - application_span
-        - application_service_graph
         - application_host
     filter:
       network:
@@ -51,3 +52,10 @@ service:
 
 serviceMonitor:
   enabled: false
+
+# Run on every node, including the tainted observability node group.
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule

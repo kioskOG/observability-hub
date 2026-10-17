@@ -1,0 +1,290 @@
+# Grafana Alloy — cluster-event collector (single replica).
+#
+# Kubernetes events are a cluster-wide stream: collecting them from the log DaemonSet
+# (alloy-override-values.yaml) made every node ship every event (N× duplicates, and the per-pod
+# `node` label kept Loki from de-duplicating). This release runs exactly one collector.
+#
+# StatefulSet + PVC: loki.source.kubernetes_events stores its last-seen position under
+# storagePath, so a restart resumes instead of re-shipping the last hour of events.
+#
+# Install: make install-alloy-events (same namespace + Secret alloy-remote-credentials as the DaemonSet).
+
+# -- Kafka tee (mirrors alloy-override-values.yaml; keep both in sync).
+kafka:
+  enabled: false
+  brokers: &kafka_brokers "my-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092"
+  topic: &kafka_topic "alloy-otel-logs"
+  clientId: &kafka_client_id "grafana-alloy-events"
+
+# The DaemonSet release (grafana-alloy) owns the PodLogs CRD; a second owner makes Helm fail.
+crds:
+  create: false
+
+global:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 473
+    runAsGroup: 473
+    fsGroup: 473
+    seccompProfile:
+      type: RuntimeDefault
+
+alloy:
+  configMap:
+    create: true
+    content: |
+      // Alloy's own logs → Loki tenant alloy-logs (same as the DaemonSet).
+      loki.process "alloy_internal_logs" {
+        stage.tenant { value = "alloy-logs" }
+        forward_to = [loki.write.loki.receiver]
+      }
+      logging {
+        level    = "info"
+        format   = "json"
+        write_to = [loki.process.alloy_internal_logs.receiver]
+      }
+
+      // Kubernetes cluster events → Loki, tenant = involved object's namespace ("cluster" for
+      // cluster-scoped objects). Pipeline unchanged from the former DaemonSet config.
+      loki.source.kubernetes_events "cluster_events" {
+        job_name   = "integrations/kubernetes/eventhandler"
+        log_format = "json"
+        forward_to = [loki.process.cluster_events.receiver]
+      }
+      loki.process "cluster_events" {
+        stage.static_labels {
+          values = {
+            cluster     = sys.env("KUBE_CLUSTER_NAME"),
+            environment = sys.env("ENVIRONMENT_NAME"),
+            region      = sys.env("AWS_REGION"),
+          }
+        }
+        stage.replace {
+          expression = "(\"type\":\"Normal\")"
+          replace = "\"type\":\"Normal\",\"level\":\"info\""
+        }
+        stage.replace {
+          expression = "(\"type\":\"Warning\")"
+          replace = "\"type\":\"Warning\",\"level\":\"warning\""
+        }
+        stage.json {
+          expressions = {
+            k8s_resource_kind = "kind",
+            k8s_resource_name = "name",
+            k8s_event_reason  = "reason",
+            k8s_event_message = "message",
+            k8s_event_type    = "type",
+            k8s_namespace_name = "namespace",
+          }
+        }
+        stage.replace {
+          source     = "k8s_namespace_name"
+          expression = "^$"
+          replace    = "cluster"
+        }
+        stage.labels {
+          values = {
+            k8s_namespace_name = "k8s_namespace_name",
+            k8s_resource_kind  = "k8s_resource_kind",
+            k8s_event_reason   = "k8s_event_reason",
+            k8s_event_type     = "k8s_event_type",
+            k8s_resource_name  = "k8s_resource_name",
+          }
+        }
+        stage.structured_metadata {
+          values = {
+            k8s_resource_name = "k8s_resource_name",
+            k8s_event_message = "k8s_event_message",
+          }
+        }
+        stage.label_keep {
+          values = ["cluster", "environment", "region", "job", "k8s_namespace_name", "k8s_resource_kind", "k8s_event_reason", "k8s_event_type"]
+        }
+        stage.tenant {
+          label = "k8s_namespace_name"
+        }
+        forward_to = [loki.write.loki.receiver{{- if .Values.kafka.enabled }}, otelcol.receiver.loki.kafka_bridge.receiver{{- end }}]
+      }
+      {{- if .Values.kafka.enabled }}
+      otelcol.exporter.kafka "to_kafka" {
+        protocol_version = "2.0.0"
+        brokers   = string.split(sys.env("KAFKA_BROKERS"), ",")
+        client_id = coalesce(sys.env("KAFKA_CLIENT_ID"), "grafana-alloy-events")
+        timeout = "30s"
+        logs {
+          topic    = sys.env("KAFKA_TOPIC")
+          encoding = "otlp_proto"
+        }
+        producer {
+          max_message_bytes = 1048576
+          compression       = "snappy"
+        }
+        sending_queue {
+          block_on_overflow = true
+          queue_size        = 2000
+        }
+        retry_on_failure {
+          enabled          = true
+          initial_interval = "2s"
+          max_interval     = "60s"
+          max_elapsed_time = "0s"
+          multiplier       = 1.8
+        }
+      }
+      otelcol.processor.batch "logs_to_kafka" {
+        timeout             = "3s"
+        send_batch_size     = 200
+        send_batch_max_size = 200
+        output {
+          logs = [otelcol.exporter.kafka.to_kafka.input]
+        }
+      }
+      otelcol.receiver.loki "kafka_bridge" {
+        output {
+          logs = [otelcol.processor.batch.logs_to_kafka.input]
+        }
+      }
+      {{- end }}
+
+      loki.write "loki" {
+        endpoint {
+          url = "http://loki-gateway.loki.svc.cluster.local/loki/api/v1/push"
+          basic_auth {
+            username = sys.env("LOKI_GATEWAY_USERNAME")
+            password = sys.env("LOKI_GATEWAY_PASSWORD")
+          }
+        }
+        external_labels = {
+          cluster     = sys.env("KUBE_CLUSTER_NAME"),
+          environment = sys.env("ENVIRONMENT_NAME"),
+          region      = sys.env("AWS_REGION"),
+          cloud       = sys.env("CLOUD_PROVIDER"),
+          platform    = sys.env("PLATFORM_TYPE"),
+        }
+      }
+
+  clustering:
+    enabled: false
+  stabilityLevel: "generally-available"
+  storagePath: /var/lib/alloy/data
+  listenAddr: 0.0.0.0
+  listenPort: 12345
+  listenScheme: HTTP
+  enableReporting: false
+
+  # Keep label values identical to the DaemonSet (alloy-override-values.yaml).
+  extraEnv:
+    - name: KUBE_CLUSTER_NAME
+      value: "millenniumfalcon"
+    - name: ENVIRONMENT_NAME
+      value: "Production"
+    - name: AWS_REGION
+      value: "us-east-2"
+    - name: CLOUD_PROVIDER
+      value: "aws"
+    - name: PLATFORM_TYPE
+      value: "eks"
+    - name: LOKI_GATEWAY_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: loki_gateway_username
+    - name: LOKI_GATEWAY_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: alloy-remote-credentials
+          key: loki_gateway_password
+    - name: KAFKA_BROKERS
+      value: *kafka_brokers
+    - name: KAFKA_TOPIC
+      value: *kafka_topic
+    - name: KAFKA_CLIENT_ID
+      value: *kafka_client_id
+
+  # No host access needed: events come from the API server.
+  mounts:
+    varlog: false
+    dockercontainers: false
+    extra:
+      - name: alloy-events-data
+        mountPath: /var/lib/alloy/data
+      - name: tmp # readOnlyRootFilesystem: give the process a writable /tmp
+        mountPath: /tmp
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+  livenessProbe:
+    httpGet:
+      path: /-/healthy
+      port: 12345
+  readinessProbe:
+    httpGet:
+      path: /-/ready
+      port: 12345
+
+image:
+  registry: "docker.io"
+  repository: grafana/alloy
+
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+
+configReloader:
+  enabled: true
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "50Mi"
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+controller:
+  type: statefulset
+  replicas: 1
+  volumes:
+    extra:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 64Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: alloy-events-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp2-standard
+        resources:
+          requests:
+            storage: 1Gi
+  nodeSelector:
+    workload: observability
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: observability
+      effect: NoSchedule
+
+service:
+  enabled: true
+  type: ClusterIP
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: kube-prometheus-stack

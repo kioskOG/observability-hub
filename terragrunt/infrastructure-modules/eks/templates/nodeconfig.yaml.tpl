@@ -10,5 +10,5 @@ spec:
     config:
       clusterDNS:
       - 172.20.0.10
-
+${KUBELET_FLAGS}
 # https://awslabs.github.io/amazon-eks-ami/nodeadm/doc/playground/

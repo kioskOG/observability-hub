@@ -1,3 +1,13 @@
+# -- Placement on the dedicated observability node group (EKS node group "observability":
+#    label workload=observability, taint dedicated=observability:NoSchedule). Referenced below.
+observabilityNodeSelector: &observabilityNodeSelector
+  workload: observability
+observabilityTolerations: &observabilityTolerations
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule
+
 # Default values for kube-prometheus-stack.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
@@ -1021,7 +1031,7 @@ alertmanager:
 
     ## Size is the expected size of the alertmanager cluster. The controller will eventually make the size of the
     ## running cluster equal to the expected size.
-    replicas: 1
+    replicas: 2 # HA pair (gossip-clustered); silences/notification log replicated
 
     ## Time duration Alertmanager shall retain data for. Default is '120h', and must match the regular expression
     ## [0-9]+(ms|s|m|h) (milliseconds seconds minutes hours).
@@ -1031,7 +1041,15 @@ alertmanager:
     ## Storage is the definition of how storage will be used by the Alertmanager instances.
     ## ref: https://github.com/prometheus-operator/prometheus-operator/blob/main/Documentation/platform/storage.md
     ##
-    storage: {}
+    # Persist silences + notification log across restarts.
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp2-standard
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
     # volumeClaimTemplate:
     #   spec:
     #     storageClassName: gluster
@@ -1065,12 +1083,17 @@ alertmanager:
     ## Define which Nodes the Pods are scheduled on.
     ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
     ##
-    nodeSelector: {}
+    nodeSelector: *observabilityNodeSelector
 
     ## Define resources requests and limits for single Pods.
     ## ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
     ##
-    resources: {}
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
     # requests:
     #   memory: 400Mi
 
@@ -1103,7 +1126,7 @@ alertmanager:
     ## If specified, the pod's tolerations.
     ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
     ##
-    tolerations: []
+    tolerations: *observabilityTolerations
     # - key: "key"
     #   operator: "Equal"
     #   value: "value"
@@ -1228,6 +1251,14 @@ alertmanager:
 ## Using default values from https://github.com/grafana/helm-charts/blob/main/charts/grafana/values.yaml
 ##
 grafana:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   envValueFrom:
     LOKI_PASSWORD:
       secretKeyRef:
@@ -2685,6 +2716,14 @@ kubeStateMetrics:
 ## Configuration for kube-state-metrics subchart
 ##
 kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
   namespaceOverride: ""
   rbac:
     create: true
@@ -3108,12 +3147,12 @@ prometheusOperator:
       ## Define which Nodes the Pods are scheduled on.
       ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
       ##
-      nodeSelector: {}
+      nodeSelector: *observabilityNodeSelector
 
       ## Tolerations for use with node taints
       ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
       ##
-      tolerations: []
+      tolerations: *observabilityTolerations
       # - key: "key"
       #   operator: "Equal"
       #   value: "value"
@@ -3181,9 +3220,9 @@ prometheusOperator:
       #   argocd.argoproj.io/hook: PreSync
       #   argocd.argoproj.io/hook-delete-policy: HookSucceeded
       podAnnotations: {}
-      nodeSelector: {}
+      nodeSelector: *observabilityNodeSelector
       affinity: {}
-      tolerations: []
+      tolerations: *observabilityTolerations
 
       ## SecurityContext holds pod-level security attributes and common container settings.
       ## This defaults to non root user with uid 2000 and gid 2000. *v1.PodSecurityContext  false
@@ -3449,7 +3488,12 @@ prometheusOperator:
 
   ## Resource limits & requests
   ##
-  resources: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
   # limits:
   #   cpu: 200m
   #   memory: 200Mi
@@ -3471,12 +3515,12 @@ prometheusOperator:
   ## Define which Nodes the Pods are scheduled on.
   ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
   ##
-  nodeSelector: {}
+  nodeSelector: *observabilityNodeSelector
 
   ## Tolerations for use with node taints
   ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
   ##
-  tolerations: []
+  tolerations: *observabilityTolerations
   # - key: "key"
   #   operator: "Equal"
   #   value: "value"
@@ -4260,7 +4304,7 @@ prometheus:
     ## Tolerations for use with node taints
     ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
     ##
-    tolerations: []
+    tolerations: *observabilityTolerations
     #  - key: "key"
     #    operator: "Equal"
     #    value: "value"
@@ -4300,11 +4344,15 @@ prometheus:
 
     ## enable --web.enable-remote-write-receiver flag on prometheus-server
     # Enable remote write receiver for Tempo metrics (default: false)
-    enableRemoteWriteReceiver: true
+    # Nothing writes into Prometheus any more (Loki ruler and Tempo remote-write to Mimir); keep the
+    # unauthenticated write endpoint closed.
+    enableRemoteWriteReceiver: false
 
     ## Name of the external label used to denote replica name
     ##
-    replicaExternalLabelName: ""
+    # Mimir HA tracker key (limits.ha_replica_label). Set explicitly: Mimir de-duplicates the 2 replicas
+    # on (cluster, prometheus_replica) and strips this label from stored series.
+    replicaExternalLabelName: "prometheus_replica"
 
     ## If true, the Operator won't add the external label used to denote replica name
     ##
@@ -4325,7 +4373,7 @@ prometheus:
     ## Define which Nodes the Pods are scheduled on.
     ## ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector
     ##
-    nodeSelector: {}
+    nodeSelector: *observabilityNodeSelector
 
     ## Secrets is a list of Secrets in the same namespace as the Prometheus object, which shall be mounted into the Prometheus Pods.
     ## The Secrets are mounted into /etc/prometheus/secrets/. Secrets changes after initial creation of a Prometheus object are not
@@ -4475,7 +4523,7 @@ prometheus:
 
     ## Maximum size of metrics
     ##
-    retentionSize: ""
+    retentionSize: "40GB" # local TSDB is a buffer (Mimir is long-term); keep it below the 50Gi PVC
 
     ## Allow out-of-order/out-of-bounds samples ingested into Prometheus for a specified duration
     ## See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#tsdb
@@ -4562,10 +4610,12 @@ prometheus:
     remoteWrite:
       - url: "http://mimir-nginx.mimir.svc.cluster.local:80/api/v1/push"
         name: mimir
-        queue_config:
-          max_samples_per_send: 1000
-          batch_send_deadline: 5s
-          max_shards: 10
+        # Prometheus-operator RemoteWriteSpec uses camelCase `queueConfig`; the former snake_case
+        # `queue_config` was silently pruned by the CRD schema, so these settings never applied.
+        queueConfig:
+          maxSamplesPerSend: 1000
+          batchSendDeadline: 5s
+          maxShards: 10
           capacity: 50000
         basicAuth:
           username:
@@ -4588,7 +4638,12 @@ prometheus:
 
     ## Resource limits & requests
     ##
-    resources: {}
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        memory: 4Gi
       # requests:
       #   cpu: 500m
       #   memory: 2Gi
@@ -4601,7 +4656,16 @@ prometheus:
     ## Prometheus StorageSpec for persistent data
     ## ref: https://github.com/prometheus-operator/prometheus-operator/blob/main/Documentation/platform/storage.md
     ##
-    storageSpec: {}
+    # PVC-backed TSDB/WAL: survives pod re-creation, so remote_write resumes from the WAL instead of
+    # losing un-shipped samples (emptyDir did).
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp2-standard
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
     ## Using PersistentVolumeClaim
     ##
     #  volumeClaimTemplate:

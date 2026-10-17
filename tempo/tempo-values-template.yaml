@@ -1,3 +1,13 @@
+# -- Placement on the dedicated observability node group (EKS node group "observability":
+#    label workload=observability, taint dedicated=observability:NoSchedule). Referenced by every component.
+observabilityNodeSelector: &observabilityNodeSelector
+  workload: observability
+observabilityTolerations: &observabilityTolerations
+  - key: dedicated
+    operator: Equal
+    value: observability
+    effect: NoSchedule
+
 global:
   image:
     # -- Overrides the Docker registry globally for all images, excluding enterprise.
@@ -45,7 +55,15 @@ tempo:
     ipFamilyPolicy: 'SingleStack'
 
 ingester:
-  replicas: 2 #3
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 3Gi
+  replicas: 3
   image:
     pullSecrets: []
     registry: docker.io
@@ -95,10 +113,10 @@ ingester:
       ring:
         kvstore:
           store: memberlist
-          replication_factor: 2 #3
+          replication_factor: 3
         tokens_file_path: /var/tempo/tokens.json
     # -- Number of copies of spans to store in the ingester ring (must be <= ingester.replicas when zoneAwareReplication is off)
-    replication_factor: 2 #3
+    replication_factor: 3
     # -- Amount of time a trace must be idle before flushing it to the wal.
     trace_idle_period: 10s
     # -- How often to sweep all tenants and move traces from live -> wal -> completed blocks.
@@ -170,16 +188,31 @@ traces:
     enabled: false
 
 metricsGenerator:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
   # -- Specifies whether a metrics-generator should be deployed
   enabled: true
   # -- Kind of deployment [StatefulSet/Deployment]
   kind: Deployment
-  replicas: 1 #2
+  replicas: 2
   image:
     pullSecrets: []
     registry: docker.io
     repository: grafana/tempo
     tag: 2.8.1
+  # Mimir remote_write credentials (see storage.remote_write below). expand-env is enabled on the
+  # metrics-generator only; it is the only component that reads the remote_write block.
+  extraArgs:
+    - -config.expand-env=true
+  extraEnvFrom:
+    - secretRef:
+        name: tempo-mimir-remote-write
   registry:
     external_labels:
       source: tempo
@@ -214,6 +247,9 @@ metricsGenerator:
     processor:
       # -- For processors to be enabled and generate metrics, pass the names of the processors to `overrides.defaults.metrics_generator.processors` value like `[service-graphs, span-metrics]`.
       service_graphs:
+        # Head sampling keeps N% of traces. Alloy stamps every kept span with sampling.ratio = N/100
+        # (double); Tempo multiplies each edge by 1/ratio so rates reflect real traffic.
+        span_multiplier_key: "sampling.ratio"
         # -- Additional dimensions to add to the metrics along with the default dimensions.
         # -- The resource and span attributes to be added to the service graph metrics, if present.
         dimensions: []
@@ -251,11 +287,13 @@ metricsGenerator:
       remote_write_add_org_id_header: false
       # -- A list of remote write endpoints.
       # -- https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write
-      remote_write: 
+      # Credentials come from Secret tempo-mimir-remote-write (ExternalSecret) via env vars,
+      # expanded at startup by -config.expand-env=true (metricsGenerator.extraArgs).
+      remote_write:
       - url: "http://mimir-nginx.mimir.svc.cluster.local:80/api/v1/push"
         basic_auth:
-          username: "mimir-nginx"
-          password: "mimir-nginx"
+          username: "${MIMIR_REMOTE_WRITE_USERNAME}"
+          password: "${MIMIR_REMOTE_WRITE_PASSWORD}"
       # - url: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
         send_exemplars: true
     # -- Used by the local blocks processor to store a wal for traces.
@@ -269,13 +307,25 @@ overrides:
   # Global ingestion limits configurations
   defaults:
     metrics_generator:
-      processors: [service-graphs, span-metrics, local-blocks]
+      # span-metrics is intentionally OFF: RED metrics (traces_spanmetrics_*) are produced by Alloy from
+      # 100% of spans (before sampling). Enabling it here would emit the same series names from sampled
+      # data. service-graphs stays here because edges need client+server spans of the same trace, which
+      # only Tempo's trace-ID sharding guarantees. local-blocks powers TraceQL metrics.
+      processors: [service-graphs, local-blocks]
 
 # global_overrides:
 #   metrics_generator_processors: [service-graphs, span-metrics, local-blocks] # [service-graphs, span-metrics, local-blocks]
 
 distributor:
-  replicas: 1 #2
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  replicas: 2
   image:
     pullSecrets: []
     registry: docker.io
@@ -335,6 +385,14 @@ distributor:
         stale_duration: 15m0s
 
 compactor:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
   replicas: 1 #2
   image:
     pullSecrets: []
@@ -370,7 +428,15 @@ compactor:
       compaction_cycle: 30s
 
 querier:
-  replicas: 1 #2
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  replicas: 2
   image:
     pullSecrets: []
     registry: docker.io
@@ -392,6 +458,15 @@ querier:
     max_concurrent_queries: 20
 
 queryFrontend:
+  replicas: 2
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
   query:
     # -- Required for grafana version <7.5 for compatibility with jaeger-ui. Doesn't work on ARM arch
     enabled: false
@@ -561,6 +636,14 @@ cache:
 # memcached is for all of the Tempo pieces to coordinate with each other.
 # you can use your self memcacherd by set enable: false and host + service
 memcached:
+  tolerations: *observabilityTolerations
+  nodeSelector: *observabilityNodeSelector
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
   # -- Specified whether the memcached cachce should be enabled
   enabled: true
   image:
@@ -599,7 +682,12 @@ memcachedExporter:
     repository: prom/memcached-exporter
     tag: v0.14.4
     pullPolicy: IfNotPresent
-  resources: {}
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
   extraArgs: []
 
 metaMonitoring:

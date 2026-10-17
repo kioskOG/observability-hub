@@ -8,7 +8,7 @@ terraform {
 
 dependency "grafana_keycloak" {
   config_path = "../../keycloak/grafana"
-  
+
   mock_outputs = {
     client_secret = "mock-secret-for-plan"
     client = {
